@@ -1,20 +1,27 @@
 use crate::auth::{basic_credentials, Authenticator};
 use crate::config::Config;
+use crate::handlers::{self, Ctx, DeviceLocks};
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use eas_jmap::{JmapError, Session};
+use eas_jmap::{JmapClient, JmapError, UserLimits};
 use eas_proto::autodiscover::{mobilesync_response, AutodiscoverRequest};
-use eas_proto::{options, Command, ProtocolVersion, RequestLine};
+use eas_proto::provision::Policy;
+use eas_proto::{options, status, Command, ProtocolVersion, RequestLine};
+use eas_state::{Device, Store, WipeStatus};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 pub struct AppState {
     pub config: Config,
     pub auth: Authenticator,
+    pub store: Store,
+    pub limits: UserLimits,
+    pub locks: DeviceLocks,
+    pub policy: Policy,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -56,7 +63,7 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-fn jmap_error(err: JmapError) -> Response {
+pub fn jmap_error(err: JmapError) -> Response {
     match err {
         JmapError::Unauthorized => unauthorized(),
         JmapError::Throttled => (
@@ -153,26 +160,87 @@ async fn activesync_post(
         "EAS request"
     );
 
-    dispatch(&state, &session, &line, command, version, request).await
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    let device = match state
+        .store
+        .touch_device(
+            &session.username,
+            &line.device_id,
+            &line.device_type,
+            user_agent,
+            version.as_str(),
+        )
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "state store failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let policy_key = line.policy_key.or_else(|| {
+        headers
+            .get("x-ms-policykey")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok())
+    });
+    if let Some(code) = policy_status(&state.config, &device, command, policy_key) {
+        tracing::info!(user = %session.username, device = %line.device_id, %command, code, "policy check failed");
+        return match command.status_response(code) {
+            Some(el) => handlers::wbxml(&el),
+            // Commands without a status element only understand HTTP 449.
+            None => StatusCode::from_u16(449)
+                .unwrap_or(StatusCode::FORBIDDEN)
+                .into_response(),
+        };
+    }
+
+    let jmap = JmapClient::new(
+        state.auth.endpoint().clone(),
+        session,
+        creds,
+        ip,
+        &state.limits,
+    );
+    let ctx = Ctx {
+        state: &state,
+        jmap,
+        device,
+        line: &line,
+        version,
+    };
+    handlers::dispatch(ctx, command, request).await
 }
 
-/// Command dispatch. Handlers arrive phase by phase (docs/PLAN.md); until a
-/// command is implemented the gateway answers 501 so clients fail loudly
-/// instead of syncing wrong data.
-async fn dispatch(
-    _state: &AppState,
-    session: &Session,
-    line: &RequestLine,
+/// Status that stops a command before it runs: blocked device, pending
+/// wipe, or a missing or stale policy key. `Provision` is always allowed
+/// through, since it is how the device fixes the last two.
+pub fn policy_status(
+    config: &Config,
+    device: &Device,
     command: Command,
-    _version: ProtocolVersion,
-    _request: Option<eas_wbxml::Element>,
-) -> Response {
-    tracing::info!(user = %session.username, device = %line.device_id, %command, "command not implemented yet");
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        format!("{command} is not implemented yet"),
-    )
-        .into_response()
+    policy_key: Option<u32>,
+) -> Option<u8> {
+    if device.blocked {
+        return Some(status::DEVICE_BLOCKED);
+    }
+    if !command.requires_policy() {
+        return None;
+    }
+    if device.wipe != WipeStatus::None {
+        return Some(status::REMOTE_WIPE_REQUESTED);
+    }
+    if !config.require_provisioning {
+        return None;
+    }
+    match (device.policy_key, policy_key) {
+        (Some(have), Some(sent)) if have == sent => None,
+        (None, _) | (_, None) | (_, Some(0)) => Some(status::DEVICE_NOT_PROVISIONED),
+        _ => Some(status::INVALID_POLICY_KEY),
+    }
 }
 
 async fn autodiscover(

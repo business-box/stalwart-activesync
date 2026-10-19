@@ -274,6 +274,10 @@ The deciding facts come from Stalwart's own repo and support portal: no EAS plan
 - [ ] Record their EAS traffic against the grommunio instance as the first fixture set.
 - [ ] Stand up a Stalwart staging instance with seeded test accounts and forwarded-header handling enabled.
 - [x] Prototype the WBXML codec; validate it against the recorded fixtures once they exist.
+- [x] Protocol core: state store, `Provision` with policy keys and remote wipe, policy checks on every command.
+- [x] Mail, first slice: JMAP client, `FolderSync`, mail `Sync` with replay and windows, `GetItemEstimate`, tested end to end against a JMAP test double.
+- [ ] Push: EventSource per user and `Ping`; then replace the polling behind `Sync` `Wait`.
+- [ ] `ItemOperations`, `SendMail`/`SmartReply`/`SmartForward`, `MoveItems`, `Search`, `Settings`.
 
 ## Sources
 

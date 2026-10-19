@@ -112,6 +112,8 @@ pub struct SyncState {
     /// JMAP state the folder's flag changes were last computed from.
     pub jmap_state: Option<String>,
     pub filter_type: u8,
+    /// Encoded `Options` element last sent for this folder.
+    pub options: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,6 +418,7 @@ impl Store {
             counter: r.get("counter"),
             jmap_state: r.get("jmap_state"),
             filter_type: r.get::<i64, _>("filter_type") as u8,
+            options: r.get("options"),
         }))
     }
 
@@ -470,12 +473,13 @@ impl Store {
         }
         let s = &commit.state;
         sqlx::query(
-            "INSERT INTO sync_state (device, folder, sync_key, prev_key, prev_response, counter, jmap_state, filter_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO sync_state (device, folder, sync_key, prev_key, prev_response, counter, jmap_state, filter_type, options)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT (device, folder) DO UPDATE SET
                sync_key = excluded.sync_key, prev_key = excluded.prev_key,
                prev_response = excluded.prev_response, counter = excluded.counter,
-               jmap_state = excluded.jmap_state, filter_type = excluded.filter_type",
+               jmap_state = excluded.jmap_state, filter_type = excluded.filter_type,
+               options = excluded.options",
         )
         .bind(device)
         .bind(&commit.folder)
@@ -485,6 +489,7 @@ impl Store {
         .bind(s.counter)
         .bind(&s.jmap_state)
         .bind(s.filter_type as i64)
+        .bind(&s.options)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -548,6 +553,7 @@ mod tests {
             counter: 1,
             jmap_state: Some("s1".into()),
             filter_type: 0,
+            options: None,
         }
     }
 

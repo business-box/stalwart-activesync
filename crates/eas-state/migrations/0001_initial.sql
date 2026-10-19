@@ -56,6 +56,8 @@ CREATE TABLE sync_state (
     counter       INTEGER NOT NULL,
     jmap_state    TEXT,
     filter_type   INTEGER NOT NULL DEFAULT 0,
+    -- Encoded Options element; devices omit Options once they sent them.
+    options       BLOB,
     PRIMARY KEY (device, folder)
 );
 
