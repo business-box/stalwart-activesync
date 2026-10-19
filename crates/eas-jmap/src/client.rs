@@ -67,11 +67,14 @@ pub struct JmapClient {
     limit: Arc<Semaphore>,
 }
 
-const USING: [&str; 4] = [
+/// Capabilities the gateway asks for, when the server offers them.
+const WANTED: [&str; 6] = [
     crate::capability::CORE,
     crate::capability::MAIL,
     crate::capability::SUBMISSION,
     crate::capability::VACATION,
+    crate::capability::CONTACTS,
+    crate::capability::CALENDARS,
 ];
 
 impl JmapClient {
@@ -141,7 +144,13 @@ impl JmapClient {
                 .iter()
                 .map(|c| json!([c.method, c.args, c.id]))
                 .collect();
-            let body = json!({ "using": USING, "methodCalls": method_calls });
+            // Naming a capability the server lacks fails the whole request.
+            let using: Vec<&str> = WANTED
+                .iter()
+                .copied()
+                .filter(|c| self.session.has(c) || *c == crate::capability::CORE)
+                .collect();
+            let body = json!({ "using": using, "methodCalls": method_calls });
             let resp = self
                 .send(
                     self.request(reqwest::Method::POST, &self.session.api_url)

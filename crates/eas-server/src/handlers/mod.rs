@@ -1,6 +1,7 @@
 //! Command handlers. Each takes the decoded request and a [`Ctx`] and
 //! returns the HTTP response.
 
+mod classes;
 mod compose;
 mod estimate;
 mod folder_ops;

@@ -1,6 +1,6 @@
 //! `GetItemEstimate`: how many changes a `Sync` would deliver per folder.
 
-use super::folder_sync::KIND_MAILBOX;
+use super::classes::Class;
 use super::sync::{parse_options, server_diff};
 use super::{wbxml, Ctx, HandlerError, HandlerResult};
 use eas_state::Item;
@@ -42,7 +42,7 @@ pub async fn handle(ctx: &Ctx<'_>, request: Option<Element>) -> HandlerResult {
         // 14.0 and later put SyncKey and Options on the AirSync page.
         let key = c.child_text(Page::AirSync, "SyncKey").unwrap_or_default();
         let folder = match store.folder(dev, &cid).await? {
-            Some(f) if f.kind == KIND_MAILBOX => f,
+            Some(f) if Class::of(&f).is_some() => f,
             _ => {
                 out.push(response(status::INVALID_COLLECTION, &cid, None));
                 continue;

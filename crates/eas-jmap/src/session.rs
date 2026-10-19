@@ -153,6 +153,32 @@ pub struct Session {
     pub max_calls_in_request: u32,
     pub max_size_upload: u64,
     pub state: String,
+    /// Capability URNs the server offers, sorted.
+    pub capabilities: Vec<String>,
+}
+
+impl Session {
+    pub fn has(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
+    }
+
+    /// Account for contacts, if the server offers them.
+    pub fn contacts(&self) -> Option<&str> {
+        self.has(capability::CONTACTS).then(|| {
+            self.contacts_account
+                .as_deref()
+                .unwrap_or(&self.mail_account)
+        })
+    }
+
+    /// Account for calendars, if the server offers them.
+    pub fn calendars(&self) -> Option<&str> {
+        self.has(capability::CALENDARS).then(|| {
+            self.calendar_account
+                .as_deref()
+                .unwrap_or(&self.mail_account)
+        })
+    }
 }
 
 impl Session {
@@ -180,6 +206,11 @@ impl Session {
             max_calls_in_request: num("maxCallsInRequest", 16).clamp(1, 1024) as u32,
             max_size_upload: num("maxSizeUpload", 50_000_000),
             state: raw.state,
+            capabilities: {
+                let mut c: Vec<String> = raw.capabilities.keys().cloned().collect();
+                c.sort();
+                c
+            },
         })
     }
 }
@@ -212,6 +243,8 @@ mod tests {
         assert_eq!(s.mail_account, "b");
         assert_eq!(s.calendar_account.as_deref(), Some("b"));
         assert_eq!(s.contacts_account, None);
+        assert_eq!(s.calendars(), Some("b"));
+        assert_eq!(s.contacts(), None);
         assert_eq!(s.max_concurrent_requests, 8);
         assert_eq!(s.max_calls_in_request, 32);
     }

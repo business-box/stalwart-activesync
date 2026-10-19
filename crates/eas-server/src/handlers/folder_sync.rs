@@ -1,4 +1,5 @@
-//! `FolderSync`: the device's folder tree, built from JMAP mailboxes.
+//! `FolderSync`: the device's folder tree, built from JMAP mailboxes and,
+//! when Stalwart offers them, address books.
 //!
 //! Folders get short numeric IDs that stay stable for the life of the
 //! device record, even across a SyncKey 0 reset. The previous response is
@@ -8,6 +9,7 @@ use super::{sync_key, wbxml, Ctx, HandlerError, HandlerResult};
 use eas_jmap::mail::Mailbox;
 use eas_state::{Folder, HierarchyCommit, HierarchyState};
 use eas_wbxml::{Element, Page};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 /// FolderSync status codes (MS-ASCMD 2.2.3.177.4).
@@ -23,10 +25,13 @@ pub mod folder_type {
     pub const DRAFTS: u8 = 3;
     pub const TRASH: u8 = 4;
     pub const SENT: u8 = 5;
+    pub const CONTACTS: u8 = 9;
     pub const USER_MAIL: u8 = 12;
+    pub const USER_CONTACTS: u8 = 14;
 }
 
 pub const KIND_MAILBOX: &str = "mailbox";
+pub const KIND_ADDRESS_BOOK: &str = "addressbook";
 
 fn type_for_role(role: Option<&str>) -> u8 {
     match role {
@@ -38,23 +43,93 @@ fn type_for_role(role: Option<&str>) -> u8 {
     }
 }
 
+/// The user-created type of a kind, used when a default type is taken.
+fn user_type(kind: &str) -> u8 {
+    match kind {
+        KIND_ADDRESS_BOOK => folder_type::USER_CONTACTS,
+        _ => folder_type::USER_MAIL,
+    }
+}
+
 fn status_response(code: u8) -> Element {
     Element::new(Page::FolderHierarchy, "FolderSync").with_text_child("Status", code.to_string())
 }
 
+/// A JMAP collection that becomes an EAS folder.
+#[derive(Debug, Clone)]
+pub struct SourceFolder {
+    pub kind: &'static str,
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub folder_type: u8,
+    pub sort_order: u32,
+}
+
+pub fn from_mailboxes(mailboxes: &[Mailbox]) -> Vec<SourceFolder> {
+    mailboxes
+        .iter()
+        .map(|m| SourceFolder {
+            kind: KIND_MAILBOX,
+            id: m.id.clone(),
+            name: m.name.clone(),
+            parent_id: m.parent_id.clone(),
+            folder_type: type_for_role(m.role.as_deref()),
+            sort_order: m.sort_order,
+        })
+        .collect()
+}
+
+/// Address books; the default one (or the first) is the device's Contacts
+/// folder.
+pub fn from_address_books(books: &[Value]) -> Vec<SourceFolder> {
+    let default = books
+        .iter()
+        .position(|b| b.get("isDefault").and_then(Value::as_bool) == Some(true))
+        .unwrap_or(0);
+    books
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| {
+            Some(SourceFolder {
+                kind: KIND_ADDRESS_BOOK,
+                id: b.get("id")?.as_str()?.to_string(),
+                name: b
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Contacts")
+                    .to_string(),
+                parent_id: None,
+                folder_type: if i == default {
+                    folder_type::CONTACTS
+                } else {
+                    folder_type::USER_CONTACTS
+                },
+                sort_order: b.get("sortOrder").and_then(Value::as_u64).unwrap_or(0) as u32,
+            })
+        })
+        .collect()
+}
+
 /// The folder list the device should have, parents before children, with
 /// IDs taken from `known` or newly assigned from `next_id`.
-pub fn desired_folders(mailboxes: &[Mailbox], known: &[Folder], next_id: &mut i64) -> Vec<Folder> {
-    let mut ids: HashMap<&str, String> = known
+pub fn desired_folders(
+    sources: &[SourceFolder],
+    known: &[Folder],
+    next_id: &mut i64,
+) -> Vec<Folder> {
+    let mut ids: HashMap<(&str, &str), String> = known
         .iter()
-        .filter(|f| f.kind == KIND_MAILBOX)
-        .map(|f| (f.jmap_id.as_str(), f.server_id.clone()))
+        .map(|f| ((f.kind.as_str(), f.jmap_id.as_str()), f.server_id.clone()))
         .collect();
-    let by_id: HashMap<&str, &Mailbox> = mailboxes.iter().map(|m| (m.id.as_str(), m)).collect();
-    let depth = |m: &Mailbox| {
+    let by_id: HashMap<(&str, &str), &SourceFolder> = sources
+        .iter()
+        .map(|m| ((m.kind, m.id.as_str()), m))
+        .collect();
+    let depth = |m: &SourceFolder| {
         let mut d = 0;
         let mut cur = m.parent_id.as_deref();
-        while let Some(p) = cur.and_then(|p| by_id.get(p)) {
+        while let Some(p) = cur.and_then(|p| by_id.get(&(m.kind, p))) {
             d += 1;
             if d > 64 {
                 break;
@@ -63,34 +138,34 @@ pub fn desired_folders(mailboxes: &[Mailbox], known: &[Folder], next_id: &mut i6
         }
         d
     };
-    let mut sorted: Vec<&Mailbox> = mailboxes.iter().collect();
-    sorted.sort_by_key(|m| (depth(m), m.sort_order, m.name.to_lowercase()));
+    let mut sorted: Vec<&SourceFolder> = sources.iter().collect();
+    sorted.sort_by_key(|m| (m.kind, depth(m), m.sort_order, m.name.to_lowercase()));
 
     let mut used_defaults = HashSet::new();
     let mut out = Vec::with_capacity(sorted.len());
     for m in sorted {
         let server_id = ids
-            .entry(m.id.as_str())
+            .entry((m.kind, m.id.as_str()))
             .or_insert_with(|| {
                 let id = next_id.to_string();
                 *next_id += 1;
                 id
             })
             .clone();
-        let mut t = type_for_role(m.role.as_deref());
+        let mut t = m.folder_type;
         // Each default folder type may appear once.
-        if t != folder_type::USER_MAIL && !used_defaults.insert(t) {
-            t = folder_type::USER_MAIL;
+        if t != user_type(m.kind) && !used_defaults.insert(t) {
+            t = user_type(m.kind);
         }
         let parent_id = m
             .parent_id
             .as_deref()
-            .and_then(|p| ids.get(p))
+            .and_then(|p| ids.get(&(m.kind, p)))
             .cloned()
             .unwrap_or_else(|| "0".into());
         out.push(Folder {
             server_id,
-            kind: KIND_MAILBOX.into(),
+            kind: m.kind.into(),
             jmap_id: m.id.clone(),
             folder_type: t,
             parent_id,
@@ -142,8 +217,23 @@ pub async fn handle(ctx: &Ctx<'_>, request: Option<Element>) -> HandlerResult {
     }
 
     let (mailboxes, _) = ctx.jmap.mailboxes().await?;
+    let mut sources = from_mailboxes(&mailboxes);
+    // Kinds listed this time; folders of other kinds are left alone.
+    let mut managed = vec![KIND_MAILBOX];
+    if let Some(account) = ctx.jmap.session().contacts() {
+        let (books, _) = ctx
+            .jmap
+            .get_all(
+                "AddressBook",
+                account,
+                Some(&["id", "name", "isDefault", "sortOrder"]),
+            )
+            .await?;
+        sources.extend(from_address_books(&books));
+        managed.push(KIND_ADDRESS_BOOK);
+    }
     let mut next_id = hs.as_ref().map(|h| h.next_folder_id).unwrap_or(1);
-    let desired = desired_folders(&mailboxes, &all_known, &mut next_id);
+    let desired = desired_folders(&sources, &all_known, &mut next_id);
     // On a reset the device knows nothing; IDs are still reused.
     let known: Vec<&Folder> = if reset {
         Vec::new()
@@ -156,7 +246,7 @@ pub async fn handle(ctx: &Ctx<'_>, request: Option<Element>) -> HandlerResult {
 
     let mut changes = Vec::new();
     for f in &known {
-        if f.kind == KIND_MAILBOX && !desired_ids.contains(f.server_id.as_str()) {
+        if managed.contains(&f.kind.as_str()) && !desired_ids.contains(f.server_id.as_str()) {
             changes.push(
                 Element::new(Page::FolderHierarchy, "Delete")
                     .with_text_child("ServerId", f.server_id.clone()),
@@ -176,7 +266,9 @@ pub async fn handle(ctx: &Ctx<'_>, request: Option<Element>) -> HandlerResult {
     // device knew them, silent cleanup after a reset.
     let delete: Vec<String> = all_known
         .iter()
-        .filter(|f| f.kind == KIND_MAILBOX && !desired_ids.contains(f.server_id.as_str()))
+        .filter(|f| {
+            managed.contains(&f.kind.as_str()) && !desired_ids.contains(f.server_id.as_str())
+        })
         .map(|f| f.server_id.clone())
         .collect();
 
@@ -242,6 +334,7 @@ mod tests {
             mb("t2", "Trash 2", None, Some("trash")),
         ];
         let mut next = 1;
+        let boxes = from_mailboxes(&boxes);
         let first = desired_folders(&boxes, &[], &mut next);
         assert_eq!(next, 5);
         let pos = |id: &str| first.iter().position(|f| f.jmap_id == id).unwrap();

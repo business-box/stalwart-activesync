@@ -13,6 +13,7 @@
 //! The items table always matches what the device was last told, so
 //! anything left over from a full window is found again next time.
 
+use super::classes::Class;
 use super::folder_sync::{folder_type, KIND_MAILBOX};
 use super::{empty, sync_key, wbxml, Ctx, HandlerError, HandlerResult};
 use eas_convert::email::{
@@ -53,6 +54,8 @@ pub struct CollectionRequest {
     pub deletes_as_moves: Option<bool>,
     pub window_size: Option<usize>,
     pub options: Option<Element>,
+    /// Fields the device handles (`Supported`, sent with SyncKey 0).
+    pub supported: Option<Element>,
     pub commands: Vec<Element>,
 }
 
@@ -114,6 +117,7 @@ pub fn parse_request(req: &Element) -> Result<SyncRequest, u8> {
             deletes_as_moves: flag_value(c, "DeletesAsMoves"),
             window_size: number(c, Page::AirSync, "WindowSize"),
             options,
+            supported: c.child(Page::AirSync, "Supported").cloned(),
             commands,
         });
     }
@@ -220,26 +224,29 @@ pub async fn server_diff(
     filter: u8,
     skip: &HashSet<String>,
 ) -> Result<Diff, HandlerError> {
+    let class = Class::of(folder).unwrap_or(Class::Mail);
+    let account = class.account(ctx)?;
+    let kind = class.jmap_type();
     // Changes first, so nothing between them and the listing is lost.
     let (changed, new_state) = match since {
-        Some(s) => match ctx.jmap.email_changes(s).await {
+        Some(s) => match ctx.jmap.changes(kind, &account, s).await {
             Ok(c) => {
                 let set: HashSet<String> = c.updated.into_iter().chain(c.created).collect();
                 (Some(set), c.new_state)
             }
             Err(e) if e.is_method("cannotCalculateChanges") => {
                 tracing::info!(device = %ctx.line.device_id, folder = %folder.server_id, "JMAP state too old, comparing all flags");
-                (None, ctx.jmap.email_state().await?)
+                (None, ctx.jmap.state(kind, &account).await?)
             }
             Err(e) => return Err(e.into()),
         },
-        None => (None, ctx.jmap.email_state().await?),
+        None => (None, ctx.jmap.state(kind, &account).await?),
     };
-    let after = filter_after(filter);
-    let current = ctx
-        .jmap
-        .email_ids(&folder.jmap_id, after.as_deref())
-        .await?;
+    let after = match class {
+        Class::Mail => filter_after(filter),
+        Class::Contacts => None,
+    };
+    let current = class.list(ctx, folder, after.as_deref()).await?;
     let current_set: HashSet<&str> = current.iter().map(String::as_str).collect();
 
     let mut diff = Diff {
@@ -262,11 +269,10 @@ pub async fn server_diff(
     }
     diff.deletes.sort();
     if !candidates.is_empty() {
-        let props = json!({ "properties": HASH_PROPERTIES });
-        for e in ctx.jmap.email_get(&candidates, &props).await? {
+        for e in class.get(ctx, &candidates, &class.hash_args()).await? {
             let id = e.get("id").and_then(Value::as_str).unwrap_or_default();
             if let Some(item) = items.get(id) {
-                if email::state_hash(&e) != item.hash {
+                if class.hash(&e) != item.hash {
                     diff.changes.push((item.server_id.clone(), e));
                 }
             }
@@ -301,6 +307,50 @@ pub(super) async fn serialise(
         out.push((id.clone(), e, data));
     }
     Ok(out)
+}
+
+/// [`serialise`] for any class.
+async fn serialise_class(
+    ctx: &Ctx<'_>,
+    class: Class,
+    ids: &[String],
+    opts: &BodyOptions,
+) -> Result<Vec<(String, Value, Element)>, HandlerError> {
+    match class {
+        Class::Mail => serialise(ctx, ids, opts).await,
+        Class::Contacts => {
+            let cards = class.get(ctx, ids, &json!({})).await?;
+            let mut by_id: HashMap<String, Value> = cards
+                .into_iter()
+                .filter_map(|c| Some((c.get("id")?.as_str()?.to_string(), c)))
+                .collect();
+            Ok(ids
+                .iter()
+                .filter_map(|id| {
+                    let c = by_id.remove(id)?;
+                    let data = eas_convert::contact::application_data(&c);
+                    Some((id.clone(), c, data))
+                })
+                .collect())
+        }
+    }
+}
+
+/// What is stored as a folder's options: the device's `Options` with its
+/// `Supported` list, which only comes with SyncKey 0, kept inside.
+fn merge_options(options: Option<Element>, supported: Option<&Element>) -> Element {
+    let mut o = options.unwrap_or_else(|| Element::new(Page::AirSync, "Options"));
+    o.children
+        .retain(|n| !matches!(n, eas_wbxml::Node::Element(e) if e.is(Page::AirSync, "Supported")));
+    if let Some(s) = supported {
+        o.push(s.clone());
+    }
+    o
+}
+
+/// Field names in a `Supported` element.
+fn supported_names(s: &Element) -> HashSet<String> {
+    s.elements().map(|e| e.name().to_string()).collect()
 }
 
 pub async fn handle(ctx: &Ctx<'_>, request: Option<Element>) -> HandlerResult {
@@ -422,7 +472,7 @@ async fn sync_collection(
     let dev = ctx.device.id;
     let cid = coll.collection_id.as_str();
     let folder = match store.folder(dev, cid).await? {
-        Some(f) if f.kind == KIND_MAILBOX => f,
+        Some(f) if Class::of(&f).is_some() => f,
         _ => {
             return Ok(Some(collection_status(
                 &coll.sync_key,
@@ -431,6 +481,7 @@ async fn sync_collection(
             )))
         }
     };
+    let class = Class::of(&folder).unwrap_or(Class::Mail);
     let state = store.sync_state(dev, cid).await?;
 
     let mut key = coll.sync_key.clone();
@@ -459,7 +510,10 @@ async fn sync_collection(
                         counter: 1,
                         jmap_state: None,
                         filter_type: filter,
-                        options: options.map(eas_wbxml::encode),
+                        options: Some(eas_wbxml::encode(&merge_options(
+                            options.cloned(),
+                            coll.supported.as_ref(),
+                        ))),
                     },
                     upsert: Vec::new(),
                     delete: Vec::new(),
@@ -490,8 +544,16 @@ async fn sync_collection(
         .options
         .as_deref()
         .and_then(|b| eas_wbxml::decode(b).ok());
-    let options = coll.options.clone().or(stored_options);
+    let supported = stored_options
+        .as_ref()
+        .and_then(|o| o.child(Page::AirSync, "Supported"))
+        .cloned();
+    let options = Some(merge_options(
+        coll.options.clone().or(stored_options),
+        supported.as_ref(),
+    ));
     let (filter, body_opts) = parse_options(options.as_ref());
+    let supported_fields = supported.as_ref().map(supported_names);
     let window = coll
         .window_size
         .or(global_window)
@@ -515,7 +577,21 @@ async fn sync_collection(
     let mut touched: HashSet<String> = HashSet::new();
     let had_commands = first && !coll.commands.is_empty();
 
-    if first {
+    if first && class == Class::Contacts {
+        apply_contact_commands(
+            ctx,
+            coll,
+            &folder,
+            supported_fields.as_ref(),
+            &mut items,
+            &by_server_id,
+            &mut responses,
+            &mut upsert,
+            &mut delete,
+            &mut touched,
+        )
+        .await?;
+    } else if first {
         apply_client_commands(
             ctx,
             coll,
@@ -558,13 +634,13 @@ async fn sync_collection(
             commands.push(
                 Element::new(Page::AirSync, "Change")
                     .with_text_child("ServerId", sid.clone())
-                    .with_child(email::change_data(e)),
+                    .with_child(class.change_data(e)),
             );
             let jmap_id = e.get("id").and_then(Value::as_str).unwrap_or_default();
             upsert.push(Item {
                 server_id: sid.clone(),
                 jmap_id: jmap_id.to_string(),
-                hash: email::state_hash(e),
+                hash: class.hash(e),
             });
         }
         room -= n_changes;
@@ -572,7 +648,7 @@ async fn sync_collection(
             jmap_state = Some(diff.new_state.clone());
         }
         let add_ids: Vec<String> = diff.adds.iter().take(room).cloned().collect();
-        for (id, e, data) in serialise(ctx, &add_ids, &body_opts).await? {
+        for (id, e, data) in serialise_class(ctx, class, &add_ids, &body_opts).await? {
             let sid = server_id(cid, &id);
             commands.push(
                 Element::new(Page::AirSync, "Add")
@@ -582,13 +658,13 @@ async fn sync_collection(
             upsert.push(Item {
                 server_id: sid,
                 jmap_id: id,
-                hash: email::state_hash(&e),
+                hash: class.hash(&e),
             });
         }
     }
 
     let options_changed = coll.options.is_some()
-        && coll.options
+        && options
             != state
                 .options
                 .as_deref()
@@ -812,6 +888,202 @@ async fn apply_client_commands(
                     .with_child(data),
                 None => el.with_text_child("Status", status::NOT_FOUND.to_string()),
             });
+        }
+    }
+    Ok(())
+}
+
+/// Applies `Add`, `Change`, `Delete` and `Fetch` from the device to cards.
+#[allow(clippy::too_many_arguments)]
+async fn apply_contact_commands(
+    ctx: &Ctx<'_>,
+    coll: &CollectionRequest,
+    folder: &Folder,
+    supported: Option<&HashSet<String>>,
+    items: &mut HashMap<String, Item>,
+    by_server_id: &HashMap<String, String>,
+    responses: &mut Vec<Element>,
+    upsert: &mut Vec<Item>,
+    delete: &mut Vec<String>,
+    touched: &mut HashSet<String>,
+) -> Result<(), HandlerError> {
+    use eas_convert::contact;
+    use eas_jmap::{SetOp, SetOutcome};
+    let class = Class::Contacts;
+    let account = class.account(ctx)?;
+    let store = &ctx.state.store;
+    let dev = ctx.device.id;
+    let response = |name: &str, id_tag: &str, id: &str, code: u8| {
+        Element::new(Page::AirSync, name)
+            .with_text_child(id_tag, id)
+            .with_text_child("Status", code.to_string())
+    };
+    // Cards whose new hash has to be read back after the device wrote them.
+    let mut written: Vec<(String, String)> = Vec::new();
+
+    for cmd in &coll.commands {
+        let sid = cmd
+            .child_text(Page::AirSync, "ServerId")
+            .unwrap_or_default();
+        let data = cmd.child(Page::AirSync, "ApplicationData");
+        match cmd.name() {
+            "Add" => {
+                let client_id = cmd
+                    .child_text(Page::AirSync, "ClientId")
+                    .unwrap_or_default();
+                let key = format!("add:{}:{client_id}", folder.server_id);
+                // A retried add gets the first answer instead of a duplicate.
+                if let Some(id) = store.client_id(dev, &key).await? {
+                    let sid = server_id(&folder.server_id, &id);
+                    responses.push(
+                        response("Add", "ClientId", &client_id, status::SUCCESS)
+                            .with_text_child("ServerId", sid),
+                    );
+                    continue;
+                }
+                let Some(data) = data else {
+                    responses.push(response(
+                        "Add",
+                        "ClientId",
+                        &client_id,
+                        status::PROTOCOL_ERROR,
+                    ));
+                    continue;
+                };
+                let card = contact::new_card(data, &folder.jmap_id);
+                match ctx
+                    .jmap
+                    .set_one(
+                        "ContactCard/set",
+                        &account,
+                        SetOp::Create(card),
+                        Value::Null,
+                    )
+                    .await?
+                {
+                    SetOutcome::Created(id) => {
+                        store.record_client_id(dev, &key, &id).await?;
+                        let sid = server_id(&folder.server_id, &id);
+                        responses.push(
+                            response("Add", "ClientId", &client_id, status::SUCCESS)
+                                .with_text_child("ServerId", sid.clone()),
+                        );
+                        touched.insert(id.clone());
+                        written.push((sid, id));
+                    }
+                    other => {
+                        tracing::info!(device = %ctx.line.device_id, ?other, "contact add failed");
+                        responses.push(response(
+                            "Add",
+                            "ClientId",
+                            &client_id,
+                            status::CONVERSION_ERROR,
+                        ));
+                    }
+                }
+            }
+            "Change" => {
+                let (Some(jmap_id), Some(data)) = (by_server_id.get(&sid), data) else {
+                    responses.push(response("Change", "ServerId", &sid, status::NOT_FOUND));
+                    continue;
+                };
+                let current = class
+                    .get(ctx, std::slice::from_ref(jmap_id), &json!({}))
+                    .await?;
+                let Some(current) = current.first() else {
+                    responses.push(response("Change", "ServerId", &sid, status::NOT_FOUND));
+                    continue;
+                };
+                let patch = contact::device_patch(current, data, supported);
+                touched.insert(jmap_id.clone());
+                if patch.is_empty() {
+                    continue;
+                }
+                match ctx
+                    .jmap
+                    .set_one(
+                        "ContactCard/set",
+                        &account,
+                        SetOp::Update(jmap_id.clone(), Value::Object(patch)),
+                        Value::Null,
+                    )
+                    .await?
+                {
+                    SetOutcome::Updated => written.push((sid, jmap_id.clone())),
+                    SetOutcome::Failed(kind) => {
+                        tracing::info!(device = %ctx.line.device_id, %kind, "contact change failed");
+                        touched.remove(jmap_id);
+                        let code = if kind == "notFound" {
+                            status::NOT_FOUND
+                        } else {
+                            status::SERVER_ERROR
+                        };
+                        responses.push(response("Change", "ServerId", &sid, code));
+                    }
+                    _ => {}
+                }
+            }
+            "Delete" => {
+                let Some(jmap_id) = by_server_id.get(&sid) else {
+                    continue;
+                };
+                let out = ctx
+                    .jmap
+                    .set_one(
+                        "ContactCard/set",
+                        &account,
+                        SetOp::Destroy(jmap_id.clone()),
+                        Value::Null,
+                    )
+                    .await?;
+                if let SetOutcome::Failed(kind) = &out {
+                    if kind != "notFound" {
+                        tracing::info!(device = %ctx.line.device_id, %kind, "contact delete failed");
+                    }
+                }
+                items.remove(jmap_id);
+                delete.push(sid);
+            }
+            "Fetch" => {
+                let Some(jmap_id) = by_server_id.get(&sid) else {
+                    responses.push(response("Fetch", "ServerId", &sid, status::NOT_FOUND));
+                    continue;
+                };
+                let found = serialise_class(
+                    ctx,
+                    class,
+                    std::slice::from_ref(jmap_id),
+                    &BodyOptions::default(),
+                )
+                .await?;
+                responses.push(match found.into_iter().next() {
+                    Some((_, _, data)) => {
+                        response("Fetch", "ServerId", &sid, status::SUCCESS).with_child(data)
+                    }
+                    None => response("Fetch", "ServerId", &sid, status::NOT_FOUND),
+                });
+            }
+            other => tracing::debug!(command = other, "ignoring unknown Sync command"),
+        }
+    }
+
+    // Record what the device now holds, so its own writes aren't echoed.
+    if !written.is_empty() {
+        let ids: Vec<String> = written.iter().map(|(_, id)| id.clone()).collect();
+        let cards = class.get(ctx, &ids, &json!({})).await?;
+        for (sid, id) in written {
+            if let Some(c) = cards
+                .iter()
+                .find(|c| c.get("id").and_then(Value::as_str) == Some(id.as_str()))
+            {
+                let item = Item {
+                    server_id: sid,
+                    jmap_id: id.clone(),
+                    hash: class.hash(c),
+                };
+                items.insert(id, item.clone());
+                upsert.push(item);
+            }
         }
     }
     Ok(())

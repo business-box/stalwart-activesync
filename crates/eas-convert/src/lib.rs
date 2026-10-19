@@ -8,5 +8,6 @@
 //! patch-only updates.
 
 pub mod compose;
+pub mod contact;
 pub mod email;
 pub mod text;

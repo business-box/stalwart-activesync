@@ -69,14 +69,35 @@ impl PushHub {
     }
 }
 
-fn relevant(changed: &HashMap<String, HashMap<String, String>>, account: &str) -> bool {
-    changed
-        .get(account)
-        .is_some_and(|t| t.contains_key("Email") || t.contains_key("Mailbox"))
+/// Data types whose changes a device can sync.
+const SYNCED_TYPES: [&str; 6] = [
+    "Email",
+    "Mailbox",
+    "ContactCard",
+    "AddressBook",
+    "CalendarEvent",
+    "Calendar",
+];
+
+fn relevant(changed: &HashMap<String, HashMap<String, String>>, accounts: &[String]) -> bool {
+    accounts.iter().any(|a| {
+        changed
+            .get(a)
+            .is_some_and(|t| SYNCED_TYPES.iter().any(|k| t.contains_key(*k)))
+    })
 }
 
 async fn run(jmap: JmapClient, tx: watch::Sender<u64>) {
-    let account = jmap.account().to_string();
+    let session = jmap.session();
+    let mut accounts = vec![jmap.account().to_string()];
+    for a in [session.contacts(), session.calendars()]
+        .into_iter()
+        .flatten()
+    {
+        if !accounts.iter().any(|x| x == a) {
+            accounts.push(a.to_string());
+        }
+    }
     let user = jmap.session().username.clone();
     let mut backoff = Duration::from_secs(5);
     loop {
@@ -86,7 +107,7 @@ async fn run(jmap: JmapClient, tx: watch::Sender<u64>) {
                 tracing::debug!(%user, "push stream open");
                 loop {
                     match es.next().await {
-                        Ok(Some(PushEvent::State(changed))) if relevant(&changed, &account) => {
+                        Ok(Some(PushEvent::State(changed))) if relevant(&changed, &accounts) => {
                             tx.send_modify(|n| *n += 1);
                         }
                         Ok(Some(_)) => {}
@@ -146,19 +167,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_mail_changes_of_the_account_count() {
+    fn only_synced_types_of_known_accounts_count() {
         let mut changed = HashMap::new();
         changed.insert(
             "a".to_string(),
-            HashMap::from([("CalendarEvent".to_string(), "1".to_string())]),
+            HashMap::from([("Thread".to_string(), "1".to_string())]),
         );
-        assert!(!relevant(&changed, "a"));
+        assert!(!relevant(&changed, &["a".to_string()]));
+        let a = vec!["a".to_string()];
+        assert!(!relevant(&changed, &["b".to_string()]));
         changed
             .get_mut("a")
             .unwrap()
-            .insert("Email".into(), "2".into());
-        assert!(relevant(&changed, "a"));
-        assert!(!relevant(&changed, "b"));
+            .insert("ContactCard".into(), "2".into());
+        assert!(relevant(&changed, &a));
+        assert!(!relevant(&changed, &["b".to_string()]));
     }
 
     #[tokio::test]

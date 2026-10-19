@@ -28,34 +28,11 @@ pub struct Changes {
     pub destroyed: Vec<String>,
 }
 
-/// IDs per `Email/get`; Stalwart's default `maxObjectsInGet` is 500.
-const GET_CHUNK: usize = 100;
-/// Page size for `Email/query`.
-const QUERY_PAGE: usize = 1_000;
 /// Hard stop for one mailbox listing, so a huge folder with no time filter
 /// can't make a single sync unbounded.
 pub const QUERY_MAX: usize = 50_000;
-/// Pages followed in `Email/changes` before giving up and resyncing flags.
-const CHANGES_MAX_PAGES: usize = 20;
 
-fn str_list(v: &Value, key: &str) -> Vec<String> {
-    v.get(key)
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn state(v: &Value, key: &str) -> Result<String, JmapError> {
-    v.get(key)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| JmapError::Protocol(format!("missing {key}")))
-}
+use crate::objects::{state_of as state, str_list};
 
 impl JmapClient {
     /// All mailboxes and the current `Mailbox` state.
@@ -77,13 +54,7 @@ impl JmapClient {
 
     /// The current `Email` state, without fetching anything.
     pub async fn email_state(&self) -> Result<String, JmapError> {
-        let res = self
-            .call(
-                "Email/get",
-                json!({ "accountId": self.account(), "ids": [], "properties": ["id"] }),
-            )
-            .await?;
-        state(&res, "state")
+        self.state("Email", self.account()).await
     }
 
     /// IDs of the emails in `mailbox`, newest first, optionally only those
@@ -98,84 +69,30 @@ impl JmapClient {
         if let Some(after) = after {
             filter.insert("after".into(), json!(after));
         }
-        let mut ids = Vec::new();
-        loop {
-            let res = self
-                .call(
-                    "Email/query",
-                    json!({
-                        "accountId": self.account(),
-                        "filter": filter,
-                        "sort": [{"property": "receivedAt", "isAscending": false}],
-                        "collapseThreads": false,
-                        "position": ids.len(),
-                        "limit": QUERY_PAGE,
-                    }),
-                )
-                .await?;
-            let page = str_list(&res, "ids");
-            let n = page.len();
-            ids.extend(page);
-            if n < QUERY_PAGE || ids.len() >= QUERY_MAX {
-                break;
-            }
-        }
-        ids.truncate(QUERY_MAX);
-        Ok(ids)
+        let mut extra = Map::new();
+        extra.insert(
+            "sort".into(),
+            json!([{"property": "receivedAt", "isAscending": false}]),
+        );
+        extra.insert("collapseThreads".into(), json!(false));
+        self.query_ids(
+            "Email",
+            self.account(),
+            Value::Object(filter),
+            extra,
+            QUERY_MAX,
+        )
+        .await
     }
 
-    /// `Email/changes` since `since`, following `hasMoreChanges`. Fails with
-    /// `cannotCalculateChanges` when the state is too old; callers then fall
-    /// back to a full comparison.
+    /// `Email/changes` since `since`, following `hasMoreChanges`.
     pub async fn email_changes(&self, since: &str) -> Result<Changes, JmapError> {
-        let mut out = Changes::default();
-        let mut since = since.to_string();
-        for _ in 0..CHANGES_MAX_PAGES {
-            let res = self
-                .call(
-                    "Email/changes",
-                    json!({ "accountId": self.account(), "sinceState": since, "maxChanges": 5_000 }),
-                )
-                .await?;
-            out.created.extend(str_list(&res, "created"));
-            out.updated.extend(str_list(&res, "updated"));
-            out.destroyed.extend(str_list(&res, "destroyed"));
-            out.new_state = state(&res, "newState")?;
-            if res.get("hasMoreChanges").and_then(Value::as_bool) != Some(true) {
-                return Ok(out);
-            }
-            since = out.new_state.clone();
-        }
-        Err(JmapError::Method {
-            method: "Email/changes".into(),
-            kind: "cannotCalculateChanges".into(),
-            description: Some("too many changes".into()),
-        })
+        self.changes("Email", self.account(), since).await
     }
 
-    /// `Email/get` for `ids` with extra arguments (`properties`,
-    /// `fetchHTMLBodyValues`, ...), in chunks. Missing IDs are skipped.
+    /// `Email/get` for `ids` with extra arguments, in chunks.
     pub async fn email_get(&self, ids: &[String], args: &Value) -> Result<Vec<Value>, JmapError> {
-        let calls = ids
-            .chunks(GET_CHUNK)
-            .enumerate()
-            .map(|(i, chunk)| {
-                let mut a = args.as_object().cloned().unwrap_or_default();
-                a.insert("accountId".into(), json!(self.account()));
-                a.insert("ids".into(), json!(chunk));
-                Call::new("Email/get", Value::Object(a), format!("g{i}"))
-            })
-            .collect::<Vec<_>>();
-        if calls.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::with_capacity(ids.len());
-        for res in self.batch(calls).await? {
-            if let Some(list) = res.get("list").and_then(Value::as_array) {
-                out.extend(list.iter().cloned());
-            }
-        }
-        Ok(out)
+        self.get("Email", self.account(), ids, args).await
     }
 
     /// `Email/set` with `update` patches keyed by email ID and `destroy` IDs.

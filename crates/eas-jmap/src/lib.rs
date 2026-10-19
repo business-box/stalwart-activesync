@@ -6,11 +6,12 @@
 //!   download, behind a per-user concurrency limit ([`UserLimits`]).
 //! - [`mail`]: mailbox listing, email queries, `/changes`, `/get` and `/set`.
 //! - [`push`]: the EventSource stream that tells the gateway when to look.
-//!
-//! Still to come: calendars and contacts.
+//! - Generic `/get`, `/changes` and `/query` for any data type, which the
+//!   contacts and calendar code uses.
 
 mod client;
 pub mod mail;
+mod objects;
 pub mod push;
 mod session;
 

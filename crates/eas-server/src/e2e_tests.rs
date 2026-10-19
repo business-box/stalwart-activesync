@@ -25,6 +25,7 @@ struct Fake {
     blobs: HashMap<String, Vec<u8>>,
     vacation: Value,
     mailboxes: Vec<Value>,
+    cards: Vec<Value>,
     /// (identity ID, envelope, stored MIME, kept in a mailbox)
     submissions: Vec<(String, Value, Vec<u8>, bool)>,
 }
@@ -61,8 +62,12 @@ impl Fake {
 async fn session(State(addr): State<(Shared, SocketAddr)>) -> Json<Value> {
     let base = format!("http://{}", addr.1);
     Json(json!({
-        "capabilities": {"urn:ietf:params:jmap:core": {"maxConcurrentRequests": 4, "maxCallsInRequest": 16}},
-        "primaryAccounts": {"urn:ietf:params:jmap:mail": "acc"},
+        "capabilities": {
+            "urn:ietf:params:jmap:core": {"maxConcurrentRequests": 4, "maxCallsInRequest": 16},
+            "urn:ietf:params:jmap:mail": {},
+            "urn:ietf:params:jmap:contacts": {}
+        },
+        "primaryAccounts": {"urn:ietf:params:jmap:mail": "acc", "urn:ietf:params:jmap:contacts": "acc"},
         "username": "alice@example.org",
         "apiUrl": format!("{base}/jmap"),
         "downloadUrl": format!("{base}/download/{{accountId}}/{{blobId}}/{{name}}?accept={{type}}"),
@@ -180,7 +185,7 @@ fn method(fake: &mut Fake, name: &str, args: &Value) -> (String, Value) {
             }
             ok(json!({"updated": {"singleton": null}}))
         }
-        "Email/changes" => {
+        "Email/changes" | "ContactCard/changes" => {
             let Ok(since) = args["sinceState"].as_str().unwrap().parse::<u64>() else {
                 return ("error".into(), json!({"type": "cannotCalculateChanges"}));
             };
@@ -258,6 +263,77 @@ fn method(fake: &mut Fake, name: &str, args: &Value) -> (String, Value) {
                 fake.bump(id.as_str().unwrap());
             }
             ok(json!({"notUpdated": not_updated}))
+        }
+        "AddressBook/get" => ok(json!({"state": "ab1", "list": [
+            {"id": "ab-personal", "name": "Personal", "isDefault": true},
+            {"id": "ab-team", "name": "Team"}
+        ]})),
+        "ContactCard/get" => {
+            let list: Vec<Value> = match args["ids"].as_array() {
+                Some(ids) => fake
+                    .cards
+                    .iter()
+                    .filter(|c| ids.contains(&c["id"]))
+                    .cloned()
+                    .collect(),
+                None => fake.cards.clone(),
+            };
+            ok(json!({"state": fake.state.to_string(), "list": list}))
+        }
+        "ContactCard/query" => {
+            let ab = args["filter"]["inAddressBook"].as_str().unwrap();
+            let ids: Vec<&Value> = fake
+                .cards
+                .iter()
+                .filter(|c| c["addressBookIds"].get(ab).is_some())
+                .map(|c| &c["id"])
+                .collect();
+            ok(json!({"ids": ids}))
+        }
+        "ContactCard/set" => {
+            let mut out = json!({});
+            if let Some(c) = args["create"].as_object() {
+                for (k, v) in c {
+                    let id = format!("c{}", fake.cards.len() + 100);
+                    let mut card = v.clone();
+                    card["id"] = json!(id);
+                    fake.cards.push(card);
+                    fake.bump(&id);
+                    out["created"][k] = json!({"id": id});
+                }
+            }
+            if let Some(u) = args["update"].as_object() {
+                for (id, patch) in u {
+                    let Some(card) = fake.cards.iter_mut().find(|c| c["id"] == id.as_str()) else {
+                        out["notUpdated"][id] = json!({"type": "notFound"});
+                        continue;
+                    };
+                    for (path, v) in patch.as_object().unwrap() {
+                        let parts: Vec<&str> = path.split('/').collect();
+                        let (last, parents) = parts.split_last().unwrap();
+                        let mut target = &mut *card;
+                        for p in parents {
+                            target = target.get_mut(*p).expect("patch parent exists");
+                        }
+                        let map = target.as_object_mut().unwrap();
+                        if v.is_null() {
+                            map.remove(*last);
+                        } else {
+                            map.insert(last.to_string(), v.clone());
+                        }
+                    }
+                    fake.bump(id);
+                    out["updated"][id] = Value::Null;
+                }
+            }
+            if let Some(d) = args["destroy"].as_array() {
+                for id in d {
+                    fake.cards.retain(|c| &c["id"] != id);
+                    fake.bump(id.as_str().unwrap());
+                }
+                out["destroyed"] = json!(d);
+            }
+            ok(out)
         }
         other => panic!("fake JMAP: unexpected {other}"),
     }
@@ -554,7 +630,7 @@ async fn provision_folder_sync_and_mail_sync() {
         changes
             .child_text(Page::FolderHierarchy, "Count")
             .as_deref(),
-        Some("4")
+        Some("6")
     );
     let adds: Vec<_> = changes
         .children_named(Page::FolderHierarchy, "Add")
@@ -1500,4 +1576,155 @@ async fn admin_api_and_metrics() {
         "{text}"
     );
     assert!(text.contains("eas_devices 1"), "{text}");
+}
+
+fn contact_data(fields: &[(&str, &str)]) -> Element {
+    let mut d = Element::new(Page::AirSync, "ApplicationData");
+    for (k, v) in fields {
+        d.push(t(Page::Contacts, k, v));
+    }
+    d
+}
+
+#[tokio::test]
+async fn contacts_sync_both_ways() {
+    let (fake, url) = start_fake().await;
+    fake.lock().unwrap().cards.push(json!({
+        "id": "card1", "@type": "Card", "addressBookIds": {"ab-personal": true},
+        "name": {"components": [{"kind": "given", "value": "Ada"}, {"kind": "surname", "value": "Lovelace"}]},
+        "phones": {"p1": {"number": "+1 555 0100", "features": {"mobile": true}}},
+        "emails": {"e1": {"address": "ada@example.org"}, "e2": {"address": "ada@two.example"}, "e3": {"address": "x@3"}, "e4": {"address": "kept@4"}},
+        "notes": {"n1": {"note": "Engine notes"}}
+    }));
+    let (gw, _) = synced_gateway(&fake, &url).await;
+    let resp = gw.ok("FolderSync", &folder_sync("0")).await;
+    let adds: Vec<Element> = resp
+        .child(Page::FolderHierarchy, "Changes")
+        .unwrap()
+        .children_named(Page::FolderHierarchy, "Add")
+        .cloned()
+        .collect();
+    let contacts = adds
+        .iter()
+        .find(|a| a.child_text(Page::FolderHierarchy, "Type").as_deref() == Some("9"))
+        .expect("default contacts folder");
+    assert_eq!(
+        contacts
+            .child_text(Page::FolderHierarchy, "DisplayName")
+            .as_deref(),
+        Some("Personal")
+    );
+    assert!(adds
+        .iter()
+        .any(|a| a.child_text(Page::FolderHierarchy, "Type").as_deref() == Some("14")));
+    let cid = contacts
+        .child_text(Page::FolderHierarchy, "ServerId")
+        .unwrap();
+
+    let k = key_of(collection(
+        &gw.ok("Sync", &sync("0", &cid, None, vec![])).await,
+    ));
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![])).await;
+    let coll = collection(&resp).clone();
+    let k = key_of(&coll);
+    let add = commands(&coll, "Add")[0].clone();
+    let sid = add.child_text(Page::AirSync, "ServerId").unwrap();
+    let data = add.child(Page::AirSync, "ApplicationData").unwrap();
+    assert_eq!(
+        data.child_text(Page::Contacts, "FileAs").as_deref(),
+        Some("Lovelace, Ada")
+    );
+    assert_eq!(
+        data.child_text(Page::Contacts, "MobilePhoneNumber")
+            .as_deref(),
+        Some("+1 555 0100")
+    );
+
+    // The device edits the mobile number and sends back everything else.
+    let mut changed = data.clone();
+    changed
+        .children
+        .retain(|n| !matches!(n, eas_wbxml::Node::Element(e) if e.name() == "MobilePhoneNumber"));
+    changed.push(t(Page::Contacts, "MobilePhoneNumber", "+1 555 0199"));
+    let change = Element::new(Page::AirSync, "Change")
+        .with_child(t(Page::AirSync, "ServerId", &sid))
+        .with_child(changed);
+    // And adds a new contact.
+    let new = Element::new(Page::AirSync, "Add")
+        .with_child(t(Page::AirSync, "ClientId", "n1"))
+        .with_child(contact_data(&[
+            ("FirstName", "Grace"),
+            ("LastName", "Hopper"),
+            ("Email1Address", "grace@example.org"),
+        ]));
+    let resp = gw
+        .ok("Sync", &sync(&k, &cid, None, vec![change, new.clone()]))
+        .await;
+    let coll = collection(&resp).clone();
+    assert!(
+        coll.child(Page::AirSync, "Commands").is_none(),
+        "no echo: {}",
+        coll.to_xml()
+    );
+    let r = coll.child(Page::AirSync, "Responses").unwrap();
+    let added = r.child(Page::AirSync, "Add").unwrap();
+    assert_eq!(
+        added.child_text(Page::AirSync, "Status").as_deref(),
+        Some("1")
+    );
+    let new_sid = added.child_text(Page::AirSync, "ServerId").unwrap();
+    let k = key_of(&coll);
+    {
+        let f = fake.lock().unwrap();
+        let ada = f.cards.iter().find(|c| c["id"] == "card1").unwrap();
+        assert_eq!(ada["phones"]["p1"]["number"], json!("+1 555 0199"));
+        assert_eq!(
+            ada["emails"]["e4"]["address"],
+            json!("kept@4"),
+            "fourth email untouched"
+        );
+        assert_eq!(ada["notes"]["n1"]["note"], json!("Engine notes"));
+        let grace = f
+            .cards
+            .iter()
+            .find(|c| c["name"]["full"] == "Grace Hopper")
+            .unwrap();
+        assert_eq!(grace["addressBookIds"], json!({"ab-personal": true}));
+    }
+
+    // The same ClientId again doesn't create a second card.
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![new])).await;
+    let coll = collection(&resp).clone();
+    let again = coll
+        .child(Page::AirSync, "Responses")
+        .unwrap()
+        .child(Page::AirSync, "Add")
+        .unwrap()
+        .clone();
+    assert_eq!(again.child_text(Page::AirSync, "ServerId"), Some(new_sid));
+    assert_eq!(fake.lock().unwrap().cards.len(), 2);
+    let k = key_of(&coll);
+
+    // A server-side edit reaches the device as a full Change.
+    {
+        let mut f = fake.lock().unwrap();
+        f.cards[0]["notes"]["n1"]["note"] = json!("Updated notes");
+        f.bump("card1");
+    }
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![])).await;
+    let coll = collection(&resp).clone();
+    let ch = commands(&coll, "Change");
+    assert_eq!(ch.len(), 1);
+    assert!(ch[0].to_xml().contains("Updated notes"));
+    let k = key_of(&coll);
+
+    // Device delete destroys the card.
+    let del = Element::new(Page::AirSync, "Delete").with_child(t(Page::AirSync, "ServerId", &sid));
+    gw.ok("Sync", &sync(&k, &cid, None, vec![del])).await;
+    assert!(!fake
+        .lock()
+        .unwrap()
+        .cards
+        .iter()
+        .any(|c| c["id"] == "card1"));
 }

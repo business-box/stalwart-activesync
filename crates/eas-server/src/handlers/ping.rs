@@ -1,7 +1,7 @@
 //! `Ping` (MS-ASCMD 2.2.1.13): hold the request until one of the listed
 //! folders has something to sync, or the heartbeat runs out.
 
-use super::folder_sync::KIND_MAILBOX;
+use super::classes::Class;
 use super::sync::server_diff;
 use super::{wbxml, Ctx, HandlerResult};
 use eas_state::Item;
@@ -44,7 +44,7 @@ async fn pending(
     let mut out = Vec::new();
     for id in folders {
         let folder = match store.folder(dev, id).await? {
-            Some(f) if f.kind == KIND_MAILBOX => f,
+            Some(f) if Class::of(&f).is_some() => f,
             _ => return Ok(Err(())),
         };
         // A folder the device never synced has nothing to report yet.
