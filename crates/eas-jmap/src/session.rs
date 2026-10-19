@@ -68,6 +68,7 @@ impl JmapError {
 pub struct StalwartEndpoint {
     base: url::Url,
     http: reqwest::Client,
+    rewrite_urls: bool,
 }
 
 impl StalwartEndpoint {
@@ -82,7 +83,20 @@ impl StalwartEndpoint {
             .timeout(Duration::from_secs(60))
             .user_agent(concat!("stalwart-activesync/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        Ok(StalwartEndpoint { base, http })
+        Ok(StalwartEndpoint {
+            base,
+            http,
+            rewrite_urls: true,
+        })
+    }
+
+    /// Whether the session's API, download, upload and EventSource URLs
+    /// are moved onto the base URL's origin (on by default). Stalwart
+    /// advertises its public `https://` hostname, which the gateway often
+    /// can't reach or doesn't trust from inside a private network.
+    pub fn with_url_rewrite(mut self, on: bool) -> StalwartEndpoint {
+        self.rewrite_urls = on;
+        self
     }
 
     pub fn base_url(&self) -> &url::Url {
@@ -118,7 +132,32 @@ impl StalwartEndpoint {
             s => return Err(JmapError::Status(s)),
         }
         let raw: RawSession = resp.json().await?;
-        Session::from_raw(raw)
+        let mut session = Session::from_raw(raw)?;
+        if self.rewrite_urls {
+            let origin = self.base.origin().ascii_serialization();
+            for u in [
+                &mut session.api_url,
+                &mut session.download_url,
+                &mut session.upload_url,
+                &mut session.event_source_url,
+            ] {
+                *u = rebase(u, &origin);
+            }
+        }
+        Ok(session)
+    }
+}
+
+/// Replaces the scheme and authority of `url` with `origin`, keeping the
+/// path and query. Works on the raw string, so URI template braces such as
+/// `{accountId}` survive (a URL parser would percent-encode them).
+fn rebase(url: &str, origin: &str) -> String {
+    let Some((_, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    match rest.find('/') {
+        Some(i) => format!("{origin}{}", &rest[i..]),
+        None => origin.to_string(),
     }
 }
 
@@ -247,6 +286,22 @@ mod tests {
         assert_eq!(s.contacts(), None);
         assert_eq!(s.max_concurrent_requests, 8);
         assert_eq!(s.max_calls_in_request, 32);
+    }
+
+    #[test]
+    fn session_urls_move_to_the_base_origin() {
+        assert_eq!(
+            rebase(
+                "https://mail.example.org/jmap/download/{accountId}/{blobId}/{name}?accept={type}",
+                "http://stalwart:8080"
+            ),
+            "http://stalwart:8080/jmap/download/{accountId}/{blobId}/{name}?accept={type}"
+        );
+        assert_eq!(
+            rebase("https://mail.example.org", "http://s:1"),
+            "http://s:1"
+        );
+        assert_eq!(rebase("relative/path", "http://s:1"), "relative/path");
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod auth;
 mod config;
 mod handlers;
 mod metrics;
+mod probe;
 mod push;
 
 #[cfg(test)]
@@ -26,6 +27,15 @@ async fn main() {
         )
         .init();
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("probe") {
+        if let Err(e) = probe::run(&args[1..]).await {
+            eprintln!("probe failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let config = match config::Config::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -34,7 +44,7 @@ async fn main() {
         }
     };
     let endpoint = match eas_jmap::StalwartEndpoint::new(&config.stalwart_url) {
-        Ok(e) => e,
+        Ok(e) => e.with_url_rewrite(config.rewrite_urls),
         Err(e) => {
             eprintln!("configuration error: STALWART_URL: {e}");
             std::process::exit(2);
@@ -101,6 +111,7 @@ mod tests {
             db_url: "sqlite::memory:".into(),
             require_provisioning: true,
             admin_token: Some("admintoken".into()),
+            rewrite_urls: true,
         };
         let endpoint = eas_jmap::StalwartEndpoint::new(&config.stalwart_url).unwrap();
         let auth = auth::Authenticator::new(endpoint, Duration::from_secs(300));

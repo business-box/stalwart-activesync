@@ -1,0 +1,58 @@
+# Caddy for the test stack. Hostnames and the TLS mode come from .env:
+#   TLS_MODE=internal  Caddy's own CA (local testing; trust its root to avoid
+#                      warnings, see README)
+#   TLS_MODE=acme      Let's Encrypt (public server; DNS must point here)
+(tls-internal) {
+	tls internal
+}
+
+# Needs ACME_EMAIL; only used with TLS_MODE=acme.
+(tls-acme) {
+	tls {$ACME_EMAIL}
+}
+
+# Long-held ActiveSync requests: Ping and Sync with Wait stay open for up to
+# 59 minutes.
+(activesync) {
+	reverse_proxy activesync:8080 {
+		transport http {
+			read_timeout 65m
+			write_timeout 65m
+		}
+		flush_interval -1
+	}
+}
+
+{$MAIL_HOST} {
+	import tls-{$TLS_MODE}
+
+	@eas path /Microsoft-Server-ActiveSync* /autodiscover/autodiscover.xml /Autodiscover/Autodiscover.xml /AutoDiscover/AutoDiscover.xml
+	handle @eas {
+		import activesync
+	}
+
+	# Everything else is Stalwart: web UI, JMAP, DAV, discovery documents.
+	handle {
+		reverse_proxy stalwart:8080 {
+			flush_interval -1
+		}
+	}
+}
+
+# Phones look for autodiscover.<domain> when the user only types an address.
+{$AUTODISCOVER_HOST} {
+	import tls-{$TLS_MODE}
+
+	@eas path /autodiscover/autodiscover.xml /Autodiscover/Autodiscover.xml /AutoDiscover/AutoDiscover.xml
+	handle @eas {
+		import activesync
+	}
+	handle {
+		respond 404
+	}
+}
+
+{$WEBMAIL_HOST} {
+	import tls-{$TLS_MODE}
+	reverse_proxy bulwark:3000
+}

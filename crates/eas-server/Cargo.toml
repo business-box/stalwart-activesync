@@ -21,6 +21,7 @@ serde_json.workspace = true
 chrono.workspace = true
 getrandom = "0.2"
 mail-parser.workspace = true
+reqwest.workspace = true
 thiserror.workspace = true
 axum.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }

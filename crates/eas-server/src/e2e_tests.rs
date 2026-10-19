@@ -504,6 +504,7 @@ impl Gateway {
             db_url: "sqlite::memory:".into(),
             require_provisioning: true,
             admin_token: Some("admintoken".into()),
+            rewrite_urls: true,
         };
         let endpoint = eas_jmap::StalwartEndpoint::new(&config.stalwart_url).unwrap();
         let auth = auth::Authenticator::new(endpoint, Duration::from_secs(300));

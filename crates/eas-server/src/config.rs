@@ -29,6 +29,10 @@ pub struct Config {
     /// `EAS_ADMIN_TOKEN`: bearer token for `/admin`; the admin API is off
     /// without it.
     pub admin_token: Option<String>,
+    /// `STALWART_REWRITE_URLS`, default `true`: reach Stalwart's JMAP API,
+    /// blobs and push at `STALWART_URL` even though the session names
+    /// Stalwart's public hostname.
+    pub rewrite_urls: bool,
 }
 
 impl Config {
@@ -64,6 +68,9 @@ impl Config {
             .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
             .unwrap_or(true);
         let admin_token = var("EAS_ADMIN_TOKEN");
+        let rewrite_urls = var("STALWART_REWRITE_URLS")
+            .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
         Ok(Config {
             listen,
             stalwart_url,
@@ -74,6 +81,7 @@ impl Config {
             db_url,
             require_provisioning,
             admin_token,
+            rewrite_urls,
         })
     }
 

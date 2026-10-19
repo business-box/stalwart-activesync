@@ -38,6 +38,10 @@ It lets the built-in mail, calendar and contacts apps on iOS and Android (Gmail,
 
 ## Running
 
+For a complete local or server test setup (Stalwart, this gateway, Bulwark webmail and Caddy) see [deploy/README.md](deploy/README.md): `docker compose up`, one bootstrap script for a domain and test users, and a probe that plays a phone.
+
+`stalwart-activesync probe <https://mail.example.org> <user> <password> [--insecure]` checks any deployment end to end: OPTIONS, Provision, FolderSync, and a first Sync of the inbox, contacts and calendar.
+
 Images are built by GitHub Actions and pushed to the GitHub Container Registry: `ghcr.io/business-box/stalwart-activesync`, tagged with the branch name, the short commit SHA, `latest` for the default branch and the version for `v*` tags.
 
 ```sh
@@ -67,6 +71,7 @@ cargo run --release -p eas-server
 | `EAS_DB_URL` | `sqlite://eas.db` | State database (`sqlite:///data/eas.db` in the container image) |
 | `EAS_REQUIRE_PROVISIONING` | `true` | Refuse commands from devices without a policy key; remote wipe needs it |
 | `EAS_ADMIN_TOKEN` | unset | Bearer token for the admin API; the API is off without it |
+| `STALWART_REWRITE_URLS` | `true` | Reach the JMAP API, blobs and push at `STALWART_URL` even though Stalwart's session names its public `https://` hostname |
 | `RUST_LOG` | `info` | Log filter; `debug` logs decoded request bodies (opaque data is never logged) |
 
 ### Admin API and metrics
