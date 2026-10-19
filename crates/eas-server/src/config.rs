@@ -21,6 +21,18 @@ pub struct Config {
     /// `EAS_AUTH_CACHE_SECS`, default 300: how long a successful login is
     /// reused before Stalwart is asked again.
     pub auth_cache_secs: u64,
+    /// `EAS_DB_URL`, default `sqlite://eas.db`: the state database.
+    pub db_url: String,
+    /// `EAS_REQUIRE_PROVISIONING`, default `true`: refuse commands from
+    /// devices without a policy key. Remote wipe only works with it on.
+    pub require_provisioning: bool,
+    /// `EAS_ADMIN_TOKEN`: bearer token for `/admin`; the admin API is off
+    /// without it.
+    pub admin_token: Option<String>,
+    /// `STALWART_REWRITE_URLS`, default `true`: reach Stalwart's JMAP API,
+    /// blobs and push at `STALWART_URL` even though the session names
+    /// Stalwart's public hostname.
+    pub rewrite_urls: bool,
 }
 
 impl Config {
@@ -51,6 +63,14 @@ impl Config {
             .map(|v| v.parse().map_err(|e| format!("EAS_AUTH_CACHE_SECS: {e}")))
             .transpose()?
             .unwrap_or(300);
+        let db_url = var("EAS_DB_URL").unwrap_or_else(|| "sqlite://eas.db".into());
+        let require_provisioning = var("EAS_REQUIRE_PROVISIONING")
+            .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
+        let admin_token = var("EAS_ADMIN_TOKEN");
+        let rewrite_urls = var("STALWART_REWRITE_URLS")
+            .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
         Ok(Config {
             listen,
             stalwart_url,
@@ -58,6 +78,10 @@ impl Config {
             trust_forwarded,
             max_body_bytes,
             auth_cache_secs,
+            db_url,
+            require_provisioning,
+            admin_token,
+            rewrite_urls,
         })
     }
 

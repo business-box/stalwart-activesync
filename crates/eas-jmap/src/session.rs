@@ -11,6 +11,7 @@ pub mod capability {
     pub const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
     pub const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
     pub const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
+    pub const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
 }
 
 /// Basic credentials as the device sent them. `Debug` never prints the
@@ -44,6 +45,22 @@ pub enum JmapError {
     Transport(#[from] reqwest::Error),
     #[error("invalid Stalwart URL: {0}")]
     Url(#[from] url::ParseError),
+    #[error("{method} failed: {kind}")]
+    Method {
+        method: String,
+        kind: String,
+        description: Option<String>,
+    },
+    #[error("unexpected JMAP response: {0}")]
+    Protocol(String),
+}
+
+impl JmapError {
+    /// True for a method error of the given JMAP type, such as
+    /// `cannotCalculateChanges`.
+    pub fn is_method(&self, t: &str) -> bool {
+        matches!(self, JmapError::Method { kind, .. } if kind == t)
+    }
 }
 
 /// Where and how to reach Stalwart's JMAP API.
@@ -51,6 +68,7 @@ pub enum JmapError {
 pub struct StalwartEndpoint {
     base: url::Url,
     http: reqwest::Client,
+    rewrite_urls: bool,
 }
 
 impl StalwartEndpoint {
@@ -65,7 +83,20 @@ impl StalwartEndpoint {
             .timeout(Duration::from_secs(60))
             .user_agent(concat!("stalwart-activesync/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        Ok(StalwartEndpoint { base, http })
+        Ok(StalwartEndpoint {
+            base,
+            http,
+            rewrite_urls: true,
+        })
+    }
+
+    /// Whether the session's API, download, upload and EventSource URLs
+    /// are moved onto the base URL's origin (on by default). Stalwart
+    /// advertises its public `https://` hostname, which the gateway often
+    /// can't reach or doesn't trust from inside a private network.
+    pub fn with_url_rewrite(mut self, on: bool) -> StalwartEndpoint {
+        self.rewrite_urls = on;
+        self
     }
 
     pub fn base_url(&self) -> &url::Url {
@@ -101,7 +132,32 @@ impl StalwartEndpoint {
             s => return Err(JmapError::Status(s)),
         }
         let raw: RawSession = resp.json().await?;
-        Session::from_raw(raw)
+        let mut session = Session::from_raw(raw)?;
+        if self.rewrite_urls {
+            let origin = self.base.origin().ascii_serialization();
+            for u in [
+                &mut session.api_url,
+                &mut session.download_url,
+                &mut session.upload_url,
+                &mut session.event_source_url,
+            ] {
+                *u = rebase(u, &origin);
+            }
+        }
+        Ok(session)
+    }
+}
+
+/// Replaces the scheme and authority of `url` with `origin`, keeping the
+/// path and query. Works on the raw string, so URI template braces such as
+/// `{accountId}` survive (a URL parser would percent-encode them).
+fn rebase(url: &str, origin: &str) -> String {
+    let Some((_, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    match rest.find('/') {
+        Some(i) => format!("{origin}{}", &rest[i..]),
+        None => origin.to_string(),
     }
 }
 
@@ -136,6 +192,32 @@ pub struct Session {
     pub max_calls_in_request: u32,
     pub max_size_upload: u64,
     pub state: String,
+    /// Capability URNs the server offers, sorted.
+    pub capabilities: Vec<String>,
+}
+
+impl Session {
+    pub fn has(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
+    }
+
+    /// Account for contacts, if the server offers them.
+    pub fn contacts(&self) -> Option<&str> {
+        self.has(capability::CONTACTS).then(|| {
+            self.contacts_account
+                .as_deref()
+                .unwrap_or(&self.mail_account)
+        })
+    }
+
+    /// Account for calendars, if the server offers them.
+    pub fn calendars(&self) -> Option<&str> {
+        self.has(capability::CALENDARS).then(|| {
+            self.calendar_account
+                .as_deref()
+                .unwrap_or(&self.mail_account)
+        })
+    }
 }
 
 impl Session {
@@ -163,6 +245,11 @@ impl Session {
             max_calls_in_request: num("maxCallsInRequest", 16).clamp(1, 1024) as u32,
             max_size_upload: num("maxSizeUpload", 50_000_000),
             state: raw.state,
+            capabilities: {
+                let mut c: Vec<String> = raw.capabilities.keys().cloned().collect();
+                c.sort();
+                c
+            },
         })
     }
 }
@@ -195,8 +282,26 @@ mod tests {
         assert_eq!(s.mail_account, "b");
         assert_eq!(s.calendar_account.as_deref(), Some("b"));
         assert_eq!(s.contacts_account, None);
+        assert_eq!(s.calendars(), Some("b"));
+        assert_eq!(s.contacts(), None);
         assert_eq!(s.max_concurrent_requests, 8);
         assert_eq!(s.max_calls_in_request, 32);
+    }
+
+    #[test]
+    fn session_urls_move_to_the_base_origin() {
+        assert_eq!(
+            rebase(
+                "https://mail.example.org/jmap/download/{accountId}/{blobId}/{name}?accept={type}",
+                "http://stalwart:8080"
+            ),
+            "http://stalwart:8080/jmap/download/{accountId}/{blobId}/{name}?accept={type}"
+        );
+        assert_eq!(
+            rebase("https://mail.example.org", "http://s:1"),
+            "http://s:1"
+        );
+        assert_eq!(rebase("relative/path", "http://s:1"), "relative/path");
     }
 
     #[test]

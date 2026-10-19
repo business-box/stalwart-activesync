@@ -1,0 +1,166 @@
+# Test stack: Stalwart, the ActiveSync gateway, Bulwark webmail, all behind
+# Caddy. Works on a laptop (*.localhost names, Caddy's own CA) and on a
+# server (real names, Let's Encrypt). See deploy/README.md.
+#
+#   cp .env.example .env    # then edit
+#   docker compose up -d
+#
+# Ports on the host:
+#   80, 443                 Caddy: Stalwart web UI and JMAP, ActiveSync, webmail
+#   25, 465, 993            Stalwart: SMTP, submission, IMAPS (direct, not via Caddy)
+#   127.0.0.1:8081          gateway admin API and /metrics (never public)
+#   127.0.0.1:8082          Stalwart's plain HTTP listener, for setup and the CLI
+
+name: eas-stack
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp"
+    environment:
+      MAIL_HOST: ${MAIL_HOST:-mail.localhost}
+      WEBMAIL_HOST: ${WEBMAIL_HOST:-webmail.localhost}
+      AUTODISCOVER_HOST: ${AUTODISCOVER_HOST:-autodiscover.localhost}
+      TLS_MODE: ${TLS_MODE:-internal}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      eas:
+        # Containers reach the public names through Caddy too, so the
+        # webmail's server-side JMAP calls take the same path as browsers.
+        aliases:
+          - ${MAIL_HOST:-mail.localhost}
+          - ${WEBMAIL_HOST:-webmail.localhost}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    logging: *logging
+
+  # Writes a minimal config.json (RocksDB in /var/lib/stalwart) on first
+  # start, so Stalwart boots straight into normal mode instead of the setup
+  # wizard. Set STALWART_SEED_CONFIG=false to use the wizard instead.
+  stalwart-init:
+    image: busybox:1.36
+    restart: "no"
+    network_mode: none
+    environment:
+      SEED: ${STALWART_SEED_CONFIG:-true}
+    command:
+      - sh
+      - -c
+      - |
+        if [ "$$SEED" = "true" ] && [ ! -f /etc/stalwart/config.json ]; then
+          echo '{"@type":"RocksDb","path":"/var/lib/stalwart/db"}' > /etc/stalwart/config.json
+          echo "wrote /etc/stalwart/config.json"
+        fi
+        chown -R 2000:2000 /etc/stalwart
+    volumes:
+      - stalwart-etc:/etc/stalwart
+    logging: *logging
+
+  stalwart:
+    image: ${STALWART_IMAGE:-stalwartlabs/stalwart:v0.16.27}
+    restart: unless-stopped
+    depends_on:
+      stalwart-init:
+        condition: service_completed_successfully
+    environment:
+      STALWART_HOSTNAME: ${MAIL_HOST:-mail.localhost}
+      # What Stalwart puts in its discovery documents and OAuth redirects.
+      STALWART_PUBLIC_URL: https://${MAIL_HOST:-mail.localhost}${PUBLIC_PORT_SUFFIX:-}
+      # Back-door admin for the first login; remove once a real admin exists.
+      STALWART_RECOVERY_ADMIN: admin:${STALWART_ADMIN_PASSWORD:?set STALWART_ADMIN_PASSWORD in .env}
+    ports:
+      - "${SMTP_PORT:-25}:25"
+      - "${SUBMISSIONS_PORT:-465}:465"
+      - "${IMAPS_PORT:-993}:993"
+      - "127.0.0.1:${STALWART_HTTP_PORT:-8082}:8080"
+    volumes:
+      - stalwart-etc:/etc/stalwart
+      - stalwart-data:/var/lib/stalwart
+    networks:
+      - eas
+    logging: *logging
+
+  activesync:
+    image: ${EAS_IMAGE:-ghcr.io/business-box/stalwart-activesync:latest}
+    restart: unless-stopped
+    depends_on:
+      - stalwart
+    environment:
+      # Straight to Stalwart's HTTP listener inside the network; session URLs
+      # are rewritten onto it (STALWART_REWRITE_URLS, on by default).
+      STALWART_URL: http://stalwart:8080
+      EAS_PUBLIC_URL: https://${MAIL_HOST:-mail.localhost}${PUBLIC_PORT_SUFFIX:-}
+      EAS_ADMIN_TOKEN: ${EAS_ADMIN_TOKEN:?set EAS_ADMIN_TOKEN in .env}
+      EAS_REQUIRE_PROVISIONING: ${EAS_REQUIRE_PROVISIONING:-true}
+      RUST_LOG: ${EAS_LOG:-info,stalwart_activesync=debug}
+    ports:
+      - "127.0.0.1:${EAS_ADMIN_PORT:-8081}:8080"
+    volumes:
+      - activesync-data:/data
+    networks:
+      - eas
+    logging: *logging
+
+  bulwark:
+    image: ${BULWARK_IMAGE:-ghcr.io/bulwarkmail/webmail:latest}
+    restart: unless-stopped
+    depends_on:
+      caddy:
+        condition: service_healthy
+      stalwart:
+        condition: service_started
+    environment:
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+      APP_NAME: ${WEBMAIL_NAME:-Bulwark Webmail}
+      JMAP_SERVER_URL: https://${MAIL_HOST:-mail.localhost}${PUBLIC_PORT_SUFFIX:-}
+      STALWART_FEATURES: "true"
+      SESSION_SECRET: ${BULWARK_SESSION_SECRET:-}
+      TRUSTED_PROXY_DEPTH: "1"
+      BULWARK_TELEMETRY: "off"
+      # Trust Caddy's local CA when TLS_MODE=internal; harmless otherwise.
+      NODE_EXTRA_CA_CERTS: /caddy/caddy/pki/authorities/local/root.crt
+    volumes:
+      - bulwark-settings:/app/data/settings
+      - bulwark-admin:/app/data/admin
+      - bulwark-admin-state:/app/data/admin-state
+      - bulwark-telemetry:/app/data/telemetry
+      - caddy-data:/caddy:ro
+    networks:
+      - eas
+    logging: *logging
+
+networks:
+  eas:
+    # Fixed subnet, so firewall rules and logs stay predictable.
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  caddy-data:
+  caddy-config:
+  stalwart-etc:
+  stalwart-data:
+  activesync-data:
+  bulwark-settings:
+  bulwark-admin:
+  bulwark-admin-state:
+  bulwark-telemetry:

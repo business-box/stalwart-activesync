@@ -1,0 +1,2055 @@
+//! End-to-end tests: real WBXML requests through the router against an
+//! in-process fake of the parts of Stalwart's JMAP API the gateway uses.
+
+use crate::{app, auth, config, handlers, metrics, push};
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{Request, StatusCode};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use eas_wbxml::{Element, Page};
+use http_body_util::BodyExt;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tower::ServiceExt;
+
+#[derive(Default)]
+struct Fake {
+    emails: Vec<Value>,
+    state: u64,
+    /// (state at which the change happened, email ID)
+    log: Vec<(u64, String)>,
+    blobs: HashMap<String, Vec<u8>>,
+    vacation: Value,
+    mailboxes: Vec<Value>,
+    cards: Vec<Value>,
+    events: Vec<Value>,
+    /// sendSchedulingMessages of each CalendarEvent/set.
+    scheduling: Vec<bool>,
+    /// (identity ID, envelope, stored MIME, kept in a mailbox)
+    submissions: Vec<(String, Value, Vec<u8>, bool)>,
+}
+
+type Shared = Arc<Mutex<Fake>>;
+
+impl Fake {
+    fn bump(&mut self, id: &str) {
+        self.state += 1;
+        self.log.push((self.state, id.to_string()));
+    }
+
+    fn add(&mut self, id: &str, mailbox: &str, received: &str) {
+        self.emails.push(json!({
+            "id": id, "blobId": format!("blob-{id}"), "threadId": format!("t-{id}"),
+            "mailboxIds": {mailbox: true}, "keywords": {},
+            "receivedAt": received, "subject": format!("Subject {id}"),
+            "from": [{"name": "Alice", "email": "alice@example.org"}],
+            "to": [{"name": "Bob", "email": "bob@example.org"}],
+            "preview": "hello",
+            "textBody": [{"partId": "1", "type": "text/plain", "size": 5}],
+            "htmlBody": [{"partId": "1", "type": "text/plain", "size": 5}],
+            "attachments": [],
+            "bodyValues": {"1": {"value": "hello"}},
+        }));
+        self.bump(id);
+    }
+
+    fn email(&mut self, id: &str) -> &mut Value {
+        self.emails.iter_mut().find(|e| e["id"] == id).unwrap()
+    }
+}
+
+async fn session(State(addr): State<(Shared, SocketAddr)>) -> Json<Value> {
+    let base = format!("http://{}", addr.1);
+    Json(json!({
+        "capabilities": {
+            "urn:ietf:params:jmap:core": {"maxConcurrentRequests": 4, "maxCallsInRequest": 16},
+            "urn:ietf:params:jmap:mail": {},
+            "urn:ietf:params:jmap:contacts": {},
+            "urn:ietf:params:jmap:calendars": {}
+        },
+        "primaryAccounts": {
+            "urn:ietf:params:jmap:mail": "acc",
+            "urn:ietf:params:jmap:contacts": "acc",
+            "urn:ietf:params:jmap:calendars": "acc"
+        },
+        "username": "alice@example.org",
+        "apiUrl": format!("{base}/jmap"),
+        "downloadUrl": format!("{base}/download/{{accountId}}/{{blobId}}/{{name}}?accept={{type}}"),
+        "uploadUrl": format!("{base}/upload/{{accountId}}/"),
+        "eventSourceUrl": format!("{base}/es"),
+        "state": "s"
+    }))
+}
+
+/// Create, update (with patch paths) and destroy on a list of objects;
+/// returns the response and the IDs that changed.
+fn object_set(list: &mut Vec<Value>, args: &Value, prefix: &str) -> (Value, Vec<String>) {
+    let mut out = json!({});
+    let mut changed = Vec::new();
+    if let Some(c) = args["create"].as_object() {
+        for (k, v) in c {
+            let id = format!("{prefix}{}", list.len() + 100);
+            let mut obj = v.clone();
+            obj["id"] = json!(id);
+            list.push(obj);
+            changed.push(id.clone());
+            out["created"][k] = json!({"id": id});
+        }
+    }
+    if let Some(u) = args["update"].as_object() {
+        for (id, patch) in u {
+            let Some(obj) = list.iter_mut().find(|c| c["id"] == id.as_str()) else {
+                out["notUpdated"][id] = json!({"type": "notFound"});
+                continue;
+            };
+            for (path, v) in patch.as_object().unwrap() {
+                let parts: Vec<&str> = path.split('/').collect();
+                let (last, parents) = parts.split_last().unwrap();
+                let mut target = &mut *obj;
+                for p in parents {
+                    target = target.get_mut(*p).expect("patch parent exists");
+                }
+                let map = target.as_object_mut().unwrap();
+                if v.is_null() {
+                    map.remove(*last);
+                } else {
+                    map.insert(last.to_string(), v.clone());
+                }
+            }
+            changed.push(id.clone());
+            out["updated"][id] = Value::Null;
+        }
+    }
+    if let Some(d) = args["destroy"].as_array() {
+        for id in d {
+            list.retain(|c| &c["id"] != id);
+            changed.push(id.as_str().unwrap().to_string());
+        }
+        out["destroyed"] = json!(d);
+    }
+    (out, changed)
+}
+
+/// The subset of JMAP email filters the gateway sends.
+fn matches(e: &Value, f: &Value) -> bool {
+    if let Some(op) = f["operator"].as_str() {
+        let mut it = f["conditions"].as_array().unwrap().iter();
+        return match op {
+            "AND" => it.all(|c| matches(e, c)),
+            "OR" => it.any(|c| matches(e, c)),
+            _ => !it.any(|c| matches(e, c)),
+        };
+    }
+    let received = e["receivedAt"].as_str().unwrap();
+    f["inMailbox"]
+        .as_str()
+        .map_or(true, |m| e["mailboxIds"].get(m).is_some())
+        && f["after"].as_str().map_or(true, |a| received > a)
+        && f["before"].as_str().map_or(true, |b| received < b)
+        && f["text"].as_str().map_or(true, |t| {
+            e["subject"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains(&t.to_lowercase())
+        })
+}
+
+fn method(fake: &mut Fake, name: &str, args: &Value) -> (String, Value) {
+    let ok = |v: Value| (name.to_string(), v);
+    match name {
+        "Mailbox/get" => ok(json!({"state": "m1", "list": fake.mailboxes})),
+        "Mailbox/set" => {
+            let mut out = json!({});
+            if let Some(c) = args["create"].as_object() {
+                for (k, v) in c {
+                    let id = format!("mb{}", fake.mailboxes.len());
+                    let mut mb = v.clone();
+                    mb["id"] = json!(id);
+                    mb["role"] = Value::Null;
+                    fake.mailboxes.push(mb);
+                    out["created"][k] = json!({"id": id});
+                }
+            }
+            if let Some(u) = args["update"].as_object() {
+                for (id, patch) in u {
+                    match fake.mailboxes.iter_mut().find(|m| m["id"] == id.as_str()) {
+                        Some(m) => {
+                            for (k, v) in patch.as_object().unwrap() {
+                                m[k] = v.clone();
+                            }
+                            out["updated"][id] = Value::Null;
+                        }
+                        None => out["notUpdated"][id] = json!({"type": "notFound"}),
+                    }
+                }
+            }
+            if let Some(d) = args["destroy"].as_array() {
+                for id in d {
+                    let id = id.as_str().unwrap().to_string();
+                    if fake.mailboxes.iter().any(|m| m["parentId"] == id.as_str()) {
+                        out["notDestroyed"][&id] = json!({"type": "mailboxHasChild"});
+                        continue;
+                    }
+                    fake.mailboxes.retain(|m| m["id"] != id.as_str());
+                    out["destroyed"] = json!([id]);
+                }
+            }
+            ok(out)
+        }
+        "Email/get" => {
+            let ids: Vec<&str> = args["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            let list: Vec<Value> = fake
+                .emails
+                .iter()
+                .filter(|e| ids.contains(&e["id"].as_str().unwrap()))
+                .cloned()
+                .collect();
+            ok(json!({"state": fake.state.to_string(), "list": list}))
+        }
+        "Email/query" => {
+            let mut list: Vec<&Value> = fake
+                .emails
+                .iter()
+                .filter(|e| matches(e, &args["filter"]))
+                .collect();
+            list.sort_by(|a, b| b["receivedAt"].as_str().cmp(&a["receivedAt"].as_str()));
+            let total = list.len();
+            let pos = args["position"].as_u64().unwrap_or(0) as usize;
+            let limit = args["limit"].as_u64().unwrap_or(1000) as usize;
+            let ids: Vec<&Value> = list
+                .iter()
+                .skip(pos)
+                .take(limit)
+                .map(|e| &e["id"])
+                .collect();
+            ok(json!({"ids": ids, "total": total}))
+        }
+        "VacationResponse/get" => ok(json!({"list": [fake.vacation.clone()]})),
+        "VacationResponse/set" => {
+            let patch = args["update"]["singleton"].as_object().unwrap().clone();
+            for (k, v) in patch {
+                fake.vacation[k] = v;
+            }
+            ok(json!({"updated": {"singleton": null}}))
+        }
+        "Email/changes" | "ContactCard/changes" | "CalendarEvent/changes" => {
+            let Ok(since) = args["sinceState"].as_str().unwrap().parse::<u64>() else {
+                return ("error".into(), json!({"type": "cannotCalculateChanges"}));
+            };
+            let updated: Vec<&String> = fake
+                .log
+                .iter()
+                .filter(|(s, _)| *s > since)
+                .map(|(_, id)| id)
+                .collect();
+            ok(
+                json!({"newState": fake.state.to_string(), "created": [], "updated": updated, "destroyed": [], "hasMoreChanges": false}),
+            )
+        }
+        "Identity/get" => ok(json!({"state": "i1", "list": [
+            {"id": "id-any", "email": "*@example.org"},
+            {"id": "id-alice", "email": "alice@example.org"}
+        ]})),
+        "Email/import" => {
+            let m = &args["emails"]["m"];
+            let blob = fake.blobs[m["blobId"].as_str().unwrap()].clone();
+            let id = format!("sent{}", fake.emails.len());
+            fake.emails.push(json!({
+                "id": id, "blobId": m["blobId"], "threadId": "t", "mailboxIds": m["mailboxIds"],
+                "keywords": m["keywords"], "receivedAt": "2026-10-19T00:00:00Z",
+                "subject": "sent", "textBody": [], "htmlBody": [], "attachments": [], "bodyValues": {},
+                "raw": String::from_utf8_lossy(&blob),
+            }));
+            fake.bump(&id);
+            ok(json!({"created": {"m": {"id": id}}}))
+        }
+        "EmailSubmission/set" => {
+            let s = &args["create"]["s"];
+            let email_id = fake.emails.last().unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let raw = fake.email(&email_id)["raw"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .to_vec();
+            let keep = args.get("onSuccessDestroyEmail").is_none();
+            if !keep {
+                fake.emails.retain(|e| e["id"] != email_id.as_str());
+            }
+            fake.submissions.push((
+                s["identityId"].as_str().unwrap().to_string(),
+                s["envelope"].clone(),
+                raw,
+                keep,
+            ));
+            ok(json!({"created": {"s": {"id": "sub1"}}}))
+        }
+        "Email/set" => {
+            let mut not_updated = serde_json::Map::new();
+            for (id, patch) in args["update"].as_object().cloned().unwrap_or_default() {
+                if !fake.emails.iter().any(|e| e["id"] == id.as_str()) {
+                    not_updated.insert(id, json!({"type": "notFound"}));
+                    continue;
+                }
+                let e = fake.email(&id);
+                for (path, v) in patch.as_object().unwrap() {
+                    let (prop, key) = path.split_once('/').unwrap();
+                    let map = e[prop].as_object_mut().unwrap();
+                    if v.is_null() {
+                        map.remove(key);
+                    } else {
+                        map.insert(key.to_string(), v.clone());
+                    }
+                }
+                fake.bump(&id);
+            }
+            for id in args["destroy"].as_array().cloned().unwrap_or_default() {
+                fake.emails.retain(|e| e["id"] != id);
+                fake.bump(id.as_str().unwrap());
+            }
+            ok(json!({"notUpdated": not_updated}))
+        }
+        "AddressBook/get" => ok(json!({"state": "ab1", "list": [
+            {"id": "ab-personal", "name": "Personal", "isDefault": true},
+            {"id": "ab-team", "name": "Team"}
+        ]})),
+        "ContactCard/get" => {
+            let list: Vec<Value> = match args["ids"].as_array() {
+                Some(ids) => fake
+                    .cards
+                    .iter()
+                    .filter(|c| ids.contains(&c["id"]))
+                    .cloned()
+                    .collect(),
+                None => fake.cards.clone(),
+            };
+            ok(json!({"state": fake.state.to_string(), "list": list}))
+        }
+        "ContactCard/query" => {
+            let ab = args["filter"]["inAddressBook"].as_str().unwrap();
+            let ids: Vec<&Value> = fake
+                .cards
+                .iter()
+                .filter(|c| c["addressBookIds"].get(ab).is_some())
+                .map(|c| &c["id"])
+                .collect();
+            ok(json!({"ids": ids}))
+        }
+        "ContactCard/set" => {
+            let mut list = std::mem::take(&mut fake.cards);
+            let (out, changed) = object_set(&mut list, args, "c");
+            fake.cards = list;
+            for id in changed {
+                fake.bump(&id);
+            }
+            ok(out)
+        }
+        "Calendar/get" => ok(json!({"state": "cal1", "list": [
+            {"id": "cal-work", "name": "Work", "isDefault": true}
+        ]})),
+        "CalendarEvent/get" => {
+            let ids = args["ids"].as_array().cloned().unwrap_or_default();
+            let list: Vec<Value> = fake
+                .events
+                .iter()
+                .filter(|e| ids.contains(&e["id"]))
+                .cloned()
+                .collect();
+            ok(json!({"state": fake.state.to_string(), "list": list}))
+        }
+        "CalendarEvent/query" => {
+            let ids: Vec<&Value> = fake
+                .events
+                .iter()
+                .filter(|e| match args["filter"]["inCalendar"].as_str() {
+                    Some(c) => e["calendarIds"].get(c).is_some(),
+                    None => true,
+                })
+                .filter(|e| match args["filter"]["uid"].as_str() {
+                    Some(u) => e["uid"] == u,
+                    None => true,
+                })
+                .map(|e| &e["id"])
+                .collect();
+            ok(json!({"ids": ids}))
+        }
+        "CalendarEvent/set" => {
+            fake.scheduling
+                .push(args["sendSchedulingMessages"].as_bool().unwrap_or(false));
+            let mut list = std::mem::take(&mut fake.events);
+            let (out, changed) = object_set(&mut list, args, "ev");
+            fake.events = list;
+            for id in changed {
+                fake.bump(&id);
+            }
+            ok(out)
+        }
+        other => panic!("fake JMAP: unexpected {other}"),
+    }
+}
+
+async fn api(State(st): State<(Shared, SocketAddr)>, Json(req): Json<Value>) -> Json<Value> {
+    let mut fake = st.0.lock().unwrap();
+    let responses: Vec<Value> = req["methodCalls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            let (name, args) = method(&mut fake, c[0].as_str().unwrap(), &c[1]);
+            json!([name, args, c[2]])
+        })
+        .collect();
+    Json(json!({"methodResponses": responses, "sessionState": "s"}))
+}
+
+/// EventSource: a `StateChange` whenever the fake's state moves.
+async fn event_source(State(st): State<(Shared, SocketAddr)>) -> axum::response::Response {
+    let shared = st.0;
+    let start = shared.lock().unwrap().state;
+    let stream = futures_util::stream::unfold(start, move |last| {
+        let shared = shared.clone();
+        async move {
+            loop {
+                let now = shared.lock().unwrap().state;
+                if now != last {
+                    let ev = format!(
+                        "event: state\ndata: {{\"@type\":\"StateChange\",\"changed\":{{\"acc\":{{\"Email\":\"{now}\"}}}}}}\n\n"
+                    );
+                    return Some((Ok::<_, std::convert::Infallible>(ev), now));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    });
+    axum::response::Response::builder()
+        .header("Content-Type", "text/event-stream")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+async fn start_fake() -> (Shared, String) {
+    let shared: Shared = Arc::default();
+    shared.lock().unwrap().mailboxes = serde_json::from_value(json!([
+        {"id": "inbox", "name": "Inbox", "role": "inbox", "parentId": null},
+        {"id": "trash", "name": "Trash", "role": "trash", "parentId": null},
+        {"id": "sent", "name": "Sent", "role": "sent", "parentId": null},
+        {"id": "sub", "name": "Projects", "role": null, "parentId": "inbox"}
+    ]))
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route("/.well-known/jmap", get(session))
+        .route("/jmap", post(api))
+        .route(
+            "/download/{acc}/{blob}/{name}",
+            get(
+                |State(st): State<(Shared, SocketAddr)>,
+                 axum::extract::Path((_, blob, _)): axum::extract::Path<(
+                    String,
+                    String,
+                    String,
+                )>| async move {
+                    let f = st.0.lock().unwrap();
+                    f.blobs
+                        .get(&blob)
+                        .cloned()
+                        .unwrap_or_else(|| b"Subject: raw\r\n\r\nraw body".to_vec())
+                },
+            ),
+        )
+        .route("/es", get(event_source))
+        .route(
+            "/upload/{acc}/",
+            post(
+                |State(st): State<(Shared, SocketAddr)>, body: axum::body::Bytes| async move {
+                    let mut f = st.0.lock().unwrap();
+                    let id = format!("up{}", f.blobs.len());
+                    f.blobs.insert(id.clone(), body.to_vec());
+                    Json(json!({"blobId": id, "type": "message/rfc822", "size": body.len()}))
+                },
+            ),
+        )
+        .with_state((shared.clone(), addr));
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (shared, format!("http://{addr}/"))
+}
+
+struct Gateway {
+    app: Router,
+    policy_key: Option<String>,
+}
+
+impl Gateway {
+    async fn new(stalwart_url: &str) -> Gateway {
+        let config = config::Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            stalwart_url: stalwart_url.into(),
+            public_url: "https://mail.example.org".into(),
+            trust_forwarded: true,
+            max_body_bytes: 1024 * 1024,
+            auth_cache_secs: 300,
+            db_url: "sqlite::memory:".into(),
+            require_provisioning: true,
+            admin_token: Some("admintoken".into()),
+            rewrite_urls: true,
+        };
+        let endpoint = eas_jmap::StalwartEndpoint::new(&config.stalwart_url).unwrap();
+        let auth = auth::Authenticator::new(endpoint, Duration::from_secs(300));
+        let app = app::router(Arc::new(app::AppState {
+            config,
+            auth,
+            store: eas_state::Store::memory().await.unwrap(),
+            limits: eas_jmap::UserLimits::new(),
+            locks: handlers::DeviceLocks::default(),
+            push: push::PushHub::default(),
+            pings: push::PingSlots::default(),
+            metrics: metrics::Metrics::default(),
+            policy: eas_proto::provision::Policy::default(),
+        }))
+        .layer(axum::extract::connect_info::MockConnectInfo(
+            SocketAddr::from(([127, 0, 0, 1], 40000)),
+        ));
+        Gateway {
+            app,
+            policy_key: None,
+        }
+    }
+
+    /// Sends a command; `None` for an empty response body.
+    async fn send(&self, cmd: &str, body: Option<&Element>) -> (StatusCode, Option<Element>) {
+        let (status, bytes) = self.send_raw(cmd, "", body).await;
+        let el = (!bytes.is_empty()).then(|| eas_wbxml::decode(&bytes).unwrap());
+        (status, el)
+    }
+
+    /// Sends a command with extra query parameters; returns the raw body.
+    async fn send_raw(
+        &self,
+        cmd: &str,
+        extra: &str,
+        body: Option<&Element>,
+    ) -> (StatusCode, Vec<u8>) {
+        let body = body.map(eas_wbxml::encode).unwrap_or_default();
+        self.post(cmd, extra, eas_wbxml::CONTENT_TYPE, body).await
+    }
+
+    async fn post(
+        &self,
+        cmd: &str,
+        extra: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut req = Request::post(format!(
+            "/Microsoft-Server-ActiveSync?Cmd={cmd}&User=alice&DeviceId=DEV1&DeviceType=iPhone{extra}"
+        ))
+        .header("MS-ASProtocolVersion", "16.1")
+        // alice:secret
+        .header("Authorization", "Basic YWxpY2U6c2VjcmV0")
+        .header("Content-Type", content_type);
+        if let Some(k) = &self.policy_key {
+            req = req.header("X-MS-PolicyKey", k);
+        }
+        let resp = self
+            .app
+            .clone()
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, bytes.to_vec())
+    }
+
+    async fn ok(&self, cmd: &str, body: &Element) -> Element {
+        let (status, el) = self.send(cmd, Some(body)).await;
+        assert_eq!(status, StatusCode::OK);
+        el.expect("response body")
+    }
+}
+
+fn t(page: Page, name: &str, text: &str) -> Element {
+    Element::new(page, name).with_text(text)
+}
+
+fn provision_request(key: Option<&str>) -> Element {
+    let mut policy = Element::new(Page::Provision, "Policy").with_child(t(
+        Page::Provision,
+        "PolicyType",
+        "MS-EAS-Provisioning-WBXML",
+    ));
+    if let Some(k) = key {
+        policy = policy
+            .with_child(t(Page::Provision, "PolicyKey", k))
+            .with_child(t(Page::Provision, "Status", "1"));
+    }
+    Element::new(Page::Provision, "Provision")
+        .with_child(Element::new(Page::Provision, "Policies").with_child(policy))
+}
+
+fn policy_key(resp: &Element) -> String {
+    resp.child(Page::Provision, "Policies")
+        .and_then(|p| p.child(Page::Provision, "Policy"))
+        .and_then(|p| p.child_text(Page::Provision, "PolicyKey"))
+        .unwrap()
+}
+
+fn folder_sync(key: &str) -> Element {
+    Element::new(Page::FolderHierarchy, "FolderSync").with_child(t(
+        Page::FolderHierarchy,
+        "SyncKey",
+        key,
+    ))
+}
+
+fn sync(key: &str, cid: &str, window: Option<&str>, commands: Vec<Element>) -> Element {
+    let mut c = Element::new(Page::AirSync, "Collection")
+        .with_child(t(Page::AirSync, "SyncKey", key))
+        .with_child(t(Page::AirSync, "CollectionId", cid));
+    if let Some(w) = window {
+        c = c.with_child(t(Page::AirSync, "WindowSize", w));
+    }
+    if key == "0" {
+        c = c.with_child(Element::new(Page::AirSync, "Options").with_child(
+            Element::new(Page::AirSyncBase, "BodyPreference").with_child(t(
+                Page::AirSyncBase,
+                "Type",
+                "2",
+            )),
+        ));
+    }
+    if !commands.is_empty() {
+        let mut cmds = Element::new(Page::AirSync, "Commands");
+        for x in commands {
+            cmds.push(x);
+        }
+        c.push(cmds);
+    }
+    Element::new(Page::AirSync, "Sync")
+        .with_child(Element::new(Page::AirSync, "Collections").with_child(c))
+}
+
+fn collection(resp: &Element) -> &Element {
+    resp.child(Page::AirSync, "Collections")
+        .and_then(|c| c.child(Page::AirSync, "Collection"))
+        .expect("collection")
+}
+
+fn key_of(coll: &Element) -> String {
+    coll.child_text(Page::AirSync, "SyncKey").unwrap()
+}
+
+fn commands<'a>(coll: &'a Element, name: &'a str) -> Vec<&'a Element> {
+    coll.child(Page::AirSync, "Commands")
+        .map(|c| c.children_named(Page::AirSync, name).collect())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn provision_folder_sync_and_mail_sync() {
+    let (fake, url) = start_fake().await;
+    {
+        let mut f = fake.lock().unwrap();
+        f.add("e1", "inbox", "2026-10-01T10:00:00Z");
+        f.add("e2", "inbox", "2026-10-02T10:00:00Z");
+        f.add("e3", "inbox", "2026-10-03T10:00:00Z");
+        f.add("e4", "sub", "2026-10-03T11:00:00Z");
+    }
+    let mut gw = Gateway::new(&url).await;
+
+    // Without a policy key, commands are refused with status 142.
+    let resp = gw.ok("FolderSync", &folder_sync("0")).await;
+    assert_eq!(
+        resp.child_text(Page::FolderHierarchy, "Status").as_deref(),
+        Some("142")
+    );
+
+    // Two-step provisioning.
+    let resp = gw.ok("Provision", &provision_request(None)).await;
+    let temp = policy_key(&resp);
+    assert!(resp.to_xml().contains("EASProvisionDoc"));
+    let resp = gw.ok("Provision", &provision_request(Some(&temp))).await;
+    let final_key = policy_key(&resp);
+    assert_ne!(temp, final_key);
+    gw.policy_key = Some(temp.clone());
+    let resp = gw.ok("FolderSync", &folder_sync("0")).await;
+    assert_eq!(
+        resp.child_text(Page::FolderHierarchy, "Status").as_deref(),
+        Some("144"),
+        "the temporary key is not valid for commands"
+    );
+    gw.policy_key = Some(final_key);
+
+    // Folder tree: parents first, roles mapped to types.
+    let resp = gw.ok("FolderSync", &folder_sync("0")).await;
+    assert_eq!(
+        resp.child_text(Page::FolderHierarchy, "Status").as_deref(),
+        Some("1")
+    );
+    let fkey = resp.child_text(Page::FolderHierarchy, "SyncKey").unwrap();
+    let changes = resp.child(Page::FolderHierarchy, "Changes").unwrap();
+    assert_eq!(
+        changes
+            .child_text(Page::FolderHierarchy, "Count")
+            .as_deref(),
+        Some("7")
+    );
+    let adds: Vec<_> = changes
+        .children_named(Page::FolderHierarchy, "Add")
+        .collect();
+    let find = |name: &str| {
+        adds.iter()
+            .find(|a| {
+                a.child_text(Page::FolderHierarchy, "DisplayName")
+                    .as_deref()
+                    == Some(name)
+            })
+            .unwrap()
+    };
+    let inbox_id = find("Inbox")
+        .child_text(Page::FolderHierarchy, "ServerId")
+        .unwrap();
+    assert_eq!(
+        find("Inbox")
+            .child_text(Page::FolderHierarchy, "Type")
+            .as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        find("Trash")
+            .child_text(Page::FolderHierarchy, "Type")
+            .as_deref(),
+        Some("4")
+    );
+    assert_eq!(
+        find("Projects").child_text(Page::FolderHierarchy, "ParentId"),
+        Some(inbox_id.clone())
+    );
+    // Unchanged tree: same key, no changes.
+    let resp = gw.ok("FolderSync", &folder_sync(&fkey)).await;
+    assert_eq!(
+        resp.child_text(Page::FolderHierarchy, "SyncKey"),
+        Some(fkey.clone())
+    );
+    // Unknown key: 9.
+    let resp = gw.ok("FolderSync", &folder_sync("bogus")).await;
+    assert_eq!(
+        resp.child_text(Page::FolderHierarchy, "Status").as_deref(),
+        Some("9")
+    );
+
+    // Initial Sync returns a key and nothing else.
+    let resp = gw.ok("Sync", &sync("0", &inbox_id, None, vec![])).await;
+    let coll = collection(&resp);
+    assert_eq!(
+        coll.child_text(Page::AirSync, "Status").as_deref(),
+        Some("1")
+    );
+    assert!(coll.child(Page::AirSync, "Commands").is_none());
+    let k1 = key_of(coll);
+
+    // Window of 2: newest first, MoreAvailable.
+    let resp = gw
+        .ok("Sync", &sync(&k1, &inbox_id, Some("2"), vec![]))
+        .await;
+    let coll = collection(&resp).clone();
+    let k2 = key_of(&coll);
+    assert!(coll.child(Page::AirSync, "MoreAvailable").is_some());
+    let added: Vec<String> = commands(&coll, "Add")
+        .iter()
+        .map(|a| a.child_text(Page::AirSync, "ServerId").unwrap())
+        .collect();
+    assert_eq!(
+        added,
+        vec![format!("{inbox_id}:e3"), format!("{inbox_id}:e2")]
+    );
+    let data = commands(&coll, "Add")[0]
+        .child(Page::AirSync, "ApplicationData")
+        .unwrap();
+    assert_eq!(
+        data.child_text(Page::Email, "Subject").as_deref(),
+        Some("Subject e3")
+    );
+    let body = data.child(Page::AirSyncBase, "Body").unwrap();
+    assert_eq!(
+        body.child_text(Page::AirSyncBase, "Type").as_deref(),
+        Some("2")
+    );
+
+    // A retry with the previous key replays the same answer.
+    let resp = gw
+        .ok("Sync", &sync(&k1, &inbox_id, Some("2"), vec![]))
+        .await;
+    assert_eq!(collection(&resp), &coll);
+
+    // The rest; options were remembered from SyncKey 0.
+    let resp = gw
+        .ok("Sync", &sync(&k2, &inbox_id, Some("2"), vec![]))
+        .await;
+    let coll = collection(&resp).clone();
+    assert!(coll.child(Page::AirSync, "MoreAvailable").is_none());
+    assert_eq!(commands(&coll, "Add").len(), 1);
+    let k3 = key_of(&coll);
+
+    // Nothing new: empty response, key unchanged.
+    let (status, body) = gw
+        .send("Sync", Some(&sync(&k3, &inbox_id, None, vec![])))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_none());
+
+    // Server-side flag: one Change.
+    {
+        let mut f = fake.lock().unwrap();
+        f.email("e1")["keywords"]["$flagged"] = json!(true);
+        f.bump("e1");
+    }
+    let resp = gw.ok("Sync", &sync(&k3, &inbox_id, None, vec![])).await;
+    let coll = collection(&resp).clone();
+    let changes = commands(&coll, "Change");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        changes[0].child_text(Page::AirSync, "ServerId"),
+        Some(format!("{inbox_id}:e1"))
+    );
+    let k4 = key_of(&coll);
+
+    // Device marks e2 read and deletes e3: read lands in JMAP, delete moves
+    // to Trash, and neither is echoed back.
+    let read = Element::new(Page::AirSync, "Change")
+        .with_child(t(Page::AirSync, "ServerId", &format!("{inbox_id}:e2")))
+        .with_child(Element::new(Page::AirSync, "ApplicationData").with_child(t(
+            Page::Email,
+            "Read",
+            "1",
+        )));
+    let del = Element::new(Page::AirSync, "Delete").with_child(t(
+        Page::AirSync,
+        "ServerId",
+        &format!("{inbox_id}:e3"),
+    ));
+    let resp = gw
+        .ok("Sync", &sync(&k4, &inbox_id, None, vec![read, del]))
+        .await;
+    let coll = collection(&resp).clone();
+    assert!(
+        coll.child(Page::AirSync, "Commands").is_none(),
+        "{}",
+        coll.to_xml()
+    );
+    assert!(coll.child(Page::AirSync, "Responses").is_none());
+    let k5 = key_of(&coll);
+    {
+        let mut f = fake.lock().unwrap();
+        assert_eq!(f.email("e2")["keywords"]["$seen"], json!(true));
+        assert_eq!(f.email("e3")["mailboxIds"], json!({"trash": true}));
+    }
+    let (_, body) = gw
+        .send("Sync", Some(&sync(&k5, &inbox_id, None, vec![])))
+        .await;
+    assert!(body.is_none());
+
+    // Estimate after a new message: 1.
+    fake.lock()
+        .unwrap()
+        .add("e5", "inbox", "2026-10-04T10:00:00Z");
+    let est = Element::new(Page::GetItemEstimate, "GetItemEstimate").with_child(
+        Element::new(Page::GetItemEstimate, "Collections").with_child(
+            Element::new(Page::GetItemEstimate, "Collection")
+                .with_child(t(Page::AirSync, "SyncKey", &k5))
+                .with_child(t(Page::GetItemEstimate, "CollectionId", &inbox_id)),
+        ),
+    );
+    let resp = gw.ok("GetItemEstimate", &est).await;
+    let r = resp.child(Page::GetItemEstimate, "Response").unwrap();
+    assert_eq!(
+        r.child_text(Page::GetItemEstimate, "Status").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        r.child(Page::GetItemEstimate, "Collection")
+            .unwrap()
+            .child_text(Page::GetItemEstimate, "Estimate")
+            .as_deref(),
+        Some("1")
+    );
+
+    // An empty Sync repeats the last request at the current key.
+    let (_, body) = gw.send("Sync", None).await;
+    let body = body.unwrap();
+    let coll = collection(&body);
+    assert_eq!(commands(coll, "Add").len(), 1);
+
+    // Unknown collection: hierarchy changed.
+    let resp = gw.ok("Sync", &sync("1-x", "999", None, vec![])).await;
+    assert_eq!(
+        collection(&resp)
+            .child_text(Page::AirSync, "Status")
+            .as_deref(),
+        Some("12")
+    );
+}
+
+fn ping(heartbeat: Option<&str>, folders: &[&str]) -> Element {
+    let mut p = Element::new(Page::Ping, "Ping");
+    if let Some(h) = heartbeat {
+        p.push(t(Page::Ping, "HeartbeatInterval", h));
+    }
+    if !folders.is_empty() {
+        let mut fs = Element::new(Page::Ping, "Folders");
+        for f in folders {
+            fs.push(
+                Element::new(Page::Ping, "Folder")
+                    .with_child(t(Page::Ping, "Id", f))
+                    .with_child(t(Page::Ping, "Class", "Email")),
+            );
+        }
+        p.push(fs);
+    }
+    p
+}
+
+/// Provisioned gateway with the inbox fully synced; returns the inbox ID.
+async fn synced_gateway(fake: &Shared, url: &str) -> (Gateway, String) {
+    fake.lock()
+        .unwrap()
+        .add("e1", "inbox", "2026-10-01T10:00:00Z");
+    let mut gw = Gateway::new(url).await;
+    let temp = policy_key(&gw.ok("Provision", &provision_request(None)).await);
+    let key = policy_key(&gw.ok("Provision", &provision_request(Some(&temp))).await);
+    gw.policy_key = Some(key);
+    let resp = gw.ok("FolderSync", &folder_sync("0")).await;
+    let inbox = resp
+        .child(Page::FolderHierarchy, "Changes")
+        .unwrap()
+        .children_named(Page::FolderHierarchy, "Add")
+        .find(|a| a.child_text(Page::FolderHierarchy, "Type").as_deref() == Some("2"))
+        .unwrap()
+        .child_text(Page::FolderHierarchy, "ServerId")
+        .unwrap();
+    let k = key_of(collection(
+        &gw.ok("Sync", &sync("0", &inbox, None, vec![])).await,
+    ));
+    let resp = gw.ok("Sync", &sync(&k, &inbox, None, vec![])).await;
+    assert_eq!(commands(collection(&resp), "Add").len(), 1);
+    (gw, inbox)
+}
+
+fn ping_status(resp: &Element) -> String {
+    resp.child_text(Page::Ping, "Status").unwrap()
+}
+
+#[tokio::test]
+async fn ping_wakes_on_push_and_validates() {
+    let (fake, url) = start_fake().await;
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+
+    // Parameter checks.
+    let (_, resp) = gw.send("Ping", None).await;
+    assert_eq!(ping_status(&resp.unwrap()), "3");
+    let resp = gw.ok("Ping", &ping(Some("10"), &[&inbox])).await;
+    assert_eq!(ping_status(&resp), "5");
+    assert_eq!(
+        resp.child_text(Page::Ping, "HeartbeatInterval").as_deref(),
+        Some("60")
+    );
+    let resp = gw.ok("Ping", &ping(Some("60"), &["999"])).await;
+    assert_eq!(ping_status(&resp), "7");
+
+    // Nothing pending: the Ping waits until push reports new mail.
+    let gw = Arc::new(gw);
+    let started = std::time::Instant::now();
+    let pinging = {
+        let gw = gw.clone();
+        let body = ping(Some("600"), &[&inbox]);
+        tokio::spawn(async move { gw.ok("Ping", &body).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!pinging.is_finished(), "Ping returned before any change");
+    fake.lock()
+        .unwrap()
+        .add("e2", "inbox", "2026-10-02T10:00:00Z");
+    let resp = tokio::time::timeout(Duration::from_secs(10), pinging)
+        .await
+        .expect("Ping woken by push")
+        .unwrap();
+    assert_eq!(ping_status(&resp), "2");
+    let folders = resp.child(Page::Ping, "Folders").unwrap();
+    assert_eq!(
+        folders.child_text(Page::Ping, "Folder"),
+        Some(inbox.clone())
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+
+    // Pending changes answer at once; an empty Ping reuses the last folders.
+    let (_, resp) = gw.send("Ping", None).await;
+    assert_eq!(ping_status(&resp.unwrap()), "2");
+}
+
+#[tokio::test]
+async fn new_ping_ends_the_waiting_one() {
+    let (fake, url) = start_fake().await;
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+    let gw = Arc::new(gw);
+    let first = {
+        let gw = gw.clone();
+        let body = ping(Some("600"), &[&inbox]);
+        tokio::spawn(async move { gw.ok("Ping", &body).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let second = {
+        let gw = gw.clone();
+        let body = ping(Some("600"), &[&inbox]);
+        tokio::spawn(async move { gw.ok("Ping", &body).await })
+    };
+    let resp = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("first Ping ended")
+        .unwrap();
+    assert_eq!(ping_status(&resp), "1");
+    second.abort();
+}
+
+#[tokio::test]
+async fn item_operations_and_move_items() {
+    let (fake, url) = start_fake().await;
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+    fake.lock().unwrap().email("e1")["attachments"] = json!([
+        {"blobId": "att1", "name": "a.txt", "type": "text/plain", "size": 25}
+    ]);
+    let raw = b"Subject: raw\r\n\r\nraw body";
+    let sid = format!("{inbox}:e1");
+
+    // Full item and attachment on demand.
+    let req = Element::new(Page::ItemOperations, "ItemOperations")
+        .with_child(
+            Element::new(Page::ItemOperations, "Fetch")
+                .with_child(t(Page::ItemOperations, "Store", "Mailbox"))
+                .with_child(t(Page::AirSync, "CollectionId", &inbox))
+                .with_child(t(Page::AirSync, "ServerId", &sid)),
+        )
+        .with_child(
+            Element::new(Page::ItemOperations, "Fetch")
+                .with_child(t(Page::ItemOperations, "Store", "Mailbox"))
+                .with_child(t(Page::AirSyncBase, "FileReference", "e1:att1")),
+        )
+        .with_child(
+            Element::new(Page::ItemOperations, "Fetch")
+                .with_child(t(Page::ItemOperations, "Store", "Mailbox"))
+                .with_child(t(Page::AirSync, "CollectionId", &inbox))
+                .with_child(t(Page::AirSync, "ServerId", &format!("{inbox}:nope"))),
+        );
+    let resp = gw.ok("ItemOperations", &req).await;
+    assert_eq!(
+        resp.child_text(Page::ItemOperations, "Status").as_deref(),
+        Some("1")
+    );
+    let fetches: Vec<_> = resp
+        .child(Page::ItemOperations, "Response")
+        .unwrap()
+        .children_named(Page::ItemOperations, "Fetch")
+        .collect();
+    assert_eq!(fetches.len(), 3);
+    let props = fetches[0]
+        .child(Page::ItemOperations, "Properties")
+        .unwrap();
+    assert_eq!(
+        props.child_text(Page::Email, "Subject").as_deref(),
+        Some("Subject e1")
+    );
+    let data = fetches[1]
+        .child(Page::ItemOperations, "Properties")
+        .unwrap()
+        .child_text(Page::ItemOperations, "Data")
+        .unwrap();
+    use base64::Engine as _;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap(),
+        raw
+    );
+    assert_eq!(
+        fetches[2]
+            .child_text(Page::ItemOperations, "Status")
+            .as_deref(),
+        Some("6")
+    );
+
+    // GetAttachment returns the bytes as the body.
+    let (status, body) = gw
+        .send_raw("GetAttachment", "&AttachmentName=e1%3Aatt1", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, raw);
+
+    // Move e1 to Projects: JMAP updated, and the inbox's next Sync doesn't
+    // report it as deleted.
+    let folders = gw.ok("FolderSync", &folder_sync("0")).await;
+    let projects = folders
+        .child(Page::FolderHierarchy, "Changes")
+        .unwrap()
+        .children_named(Page::FolderHierarchy, "Add")
+        .find(|a| {
+            a.child_text(Page::FolderHierarchy, "DisplayName")
+                .as_deref()
+                == Some("Projects")
+        })
+        .unwrap()
+        .child_text(Page::FolderHierarchy, "ServerId")
+        .unwrap();
+    // FolderSync 0 reset the device's sync state; sync the inbox again.
+    let k = key_of(collection(
+        &gw.ok("Sync", &sync("0", &inbox, None, vec![])).await,
+    ));
+    let resp = gw.ok("Sync", &sync(&k, &inbox, None, vec![])).await;
+    let k = key_of(collection(&resp));
+    let mv = Element::new(Page::Move, "MoveItems")
+        .with_child(
+            Element::new(Page::Move, "Move")
+                .with_child(t(Page::Move, "SrcMsgId", &sid))
+                .with_child(t(Page::Move, "SrcFldId", &inbox))
+                .with_child(t(Page::Move, "DstFldId", &projects)),
+        )
+        .with_child(
+            Element::new(Page::Move, "Move")
+                .with_child(t(Page::Move, "SrcMsgId", &sid))
+                .with_child(t(Page::Move, "SrcFldId", &inbox))
+                .with_child(t(Page::Move, "DstFldId", &inbox)),
+        );
+    let resp = gw.ok("MoveItems", &mv).await;
+    let rs: Vec<_> = resp.children_named(Page::Move, "Response").collect();
+    assert_eq!(rs[0].child_text(Page::Move, "Status").as_deref(), Some("3"));
+    assert_eq!(
+        rs[0].child_text(Page::Move, "DstMsgId"),
+        Some(format!("{projects}:e1"))
+    );
+    assert_eq!(rs[1].child_text(Page::Move, "Status").as_deref(), Some("4"));
+    assert_eq!(
+        fake.lock().unwrap().email("e1")["mailboxIds"],
+        json!({"sub": true})
+    );
+    let (_, body) = gw.send("Sync", Some(&sync(&k, &inbox, None, vec![]))).await;
+    assert!(body.is_none(), "{:?}", body.map(|b| b.to_xml()));
+}
+
+fn compose(cmd: &str, client_id: &str, source: Option<&str>, mime: &str) -> Element {
+    let mut el = Element::new(Page::ComposeMail, cmd)
+        .with_child(t(Page::ComposeMail, "ClientId", client_id))
+        .with_child(Element::new(Page::ComposeMail, "SaveInSentItems"));
+    if let Some(item) = source {
+        el.push(Element::new(Page::ComposeMail, "Source").with_child(t(
+            Page::ComposeMail,
+            "ItemId",
+            item,
+        )));
+    }
+    el.with_child(Element::new(Page::ComposeMail, "Mime").with_opaque(mime.as_bytes().to_vec()))
+}
+
+#[tokio::test]
+async fn send_reply_and_forward() {
+    let (fake, url) = start_fake().await;
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+    let mime = "From: Alice <alice@example.org>\r\nTo: bob@example.org\r\nBcc: secret@example.org\r\nSubject: Hi\r\n\r\nNew text\r\n";
+
+    // SendMail: empty 200, Bcc in the envelope only, copy kept in Sent.
+    let (status, body) = gw
+        .send("SendMail", Some(&compose("SendMail", "c1", None, mime)))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_none(), "{:?}", body.map(|b| b.to_xml()));
+    {
+        let f = fake.lock().unwrap();
+        let (identity, envelope, raw, keep) = &f.submissions[0];
+        assert_eq!(identity, "id-alice");
+        assert_eq!(envelope["mailFrom"]["email"], "alice@example.org");
+        assert_eq!(
+            envelope["rcptTo"],
+            json!([{"email": "bob@example.org"}, {"email": "secret@example.org"}])
+        );
+        let raw = String::from_utf8_lossy(raw);
+        assert!(!raw.contains("secret@"), "{raw}");
+        assert!(*keep);
+    }
+
+    // The same ClientId again: not sent twice.
+    let resp = gw
+        .ok("SendMail", &compose("SendMail", "c1", None, mime))
+        .await;
+    assert_eq!(
+        resp.child_text(Page::ComposeMail, "Status").as_deref(),
+        Some("118")
+    );
+    assert_eq!(fake.lock().unwrap().submissions.len(), 1);
+
+    // SmartReply quotes the original and marks it answered.
+    let reply = "From: alice@example.org\r\nTo: bob@example.org\r\nSubject: Re: Subject e1\r\n\r\nThanks!\r\n";
+    let (status, body) = gw
+        .send(
+            "SmartReply",
+            Some(&compose(
+                "SmartReply",
+                "c2",
+                Some(&format!("{inbox}:e1")),
+                reply,
+            )),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{:?}", body.map(|b| b.to_xml()));
+    {
+        let mut f = fake.lock().unwrap();
+        let raw = String::from_utf8_lossy(&f.submissions[1].2).to_string();
+        assert!(raw.contains("Thanks!"), "{raw}");
+        assert!(raw.contains("> hello"), "{raw}");
+        assert_eq!(f.email("e1")["keywords"]["$answered"], json!(true));
+    }
+
+    // SmartForward of an unknown item: 150.
+    let resp = gw
+        .ok(
+            "SmartForward",
+            &compose("SmartForward", "c3", Some(&format!("{inbox}:gone")), reply),
+        )
+        .await;
+    assert_eq!(
+        resp.child_text(Page::ComposeMail, "Status").as_deref(),
+        Some("150")
+    );
+
+    // Message without recipients: 119.
+    let resp = gw
+        .ok(
+            "SendMail",
+            &compose(
+                "SendMail",
+                "c4",
+                None,
+                "From: alice@example.org\r\nSubject: x\r\n\r\nx",
+            ),
+        )
+        .await;
+    assert_eq!(
+        resp.child_text(Page::ComposeMail, "Status").as_deref(),
+        Some("119")
+    );
+
+    // Older clients post raw MIME with options in the URI.
+    let (status, body) = gw
+        .post(
+            "SendMail",
+            "&SaveInSent=T",
+            "message/rfc822",
+            mime.as_bytes().to_vec(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(fake.lock().unwrap().submissions.len(), 3);
+}
+
+fn settings_t(name: &str, v: &str) -> Element {
+    Element::new(Page::Settings, name).with_text(v)
+}
+
+#[tokio::test]
+async fn settings_and_search() {
+    let (fake, url) = start_fake().await;
+    fake.lock().unwrap().vacation = json!({"id": "singleton", "isEnabled": false});
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+    {
+        let mut f = fake.lock().unwrap();
+        f.add("inv1", "inbox", "2026-10-05T10:00:00Z");
+        f.email("inv1")["subject"] = json!("Invoice October");
+        f.add("inv2", "sub", "2026-10-06T10:00:00Z");
+        f.email("inv2")["subject"] = json!("Invoice November");
+    }
+
+    // Out of office on, then read back; user information.
+    let set = Element::new(Page::Settings, "Settings")
+        .with_child(
+            Element::new(Page::Settings, "Oof").with_child(
+                Element::new(Page::Settings, "Set")
+                    .with_child(settings_t("OofState", "1"))
+                    .with_child(
+                        Element::new(Page::Settings, "OofMessage")
+                            .with_child(Element::new(Page::Settings, "AppliesToInternal"))
+                            .with_child(settings_t("Enabled", "1"))
+                            .with_child(settings_t("ReplyMessage", "On holiday"))
+                            .with_child(settings_t("BodyType", "Text")),
+                    ),
+            ),
+        )
+        .with_child(
+            Element::new(Page::Settings, "DeviceInformation").with_child(
+                Element::new(Page::Settings, "Set").with_child(settings_t("Model", "iPhone16,2")),
+            ),
+        );
+    let resp = gw.ok("Settings", &set).await;
+    assert_eq!(
+        resp.child_text(Page::Settings, "Status").as_deref(),
+        Some("1")
+    );
+    let oof = resp.child(Page::Settings, "Oof").unwrap();
+    assert_eq!(
+        oof.child_text(Page::Settings, "Status").as_deref(),
+        Some("1")
+    );
+    {
+        let f = fake.lock().unwrap();
+        assert_eq!(f.vacation["isEnabled"], json!(true));
+        assert_eq!(f.vacation["textBody"], json!("On holiday"));
+    }
+    let get = Element::new(Page::Settings, "Settings")
+        .with_child(Element::new(Page::Settings, "Oof").with_child(
+            Element::new(Page::Settings, "Get").with_child(settings_t("BodyType", "Text")),
+        ))
+        .with_child(
+            Element::new(Page::Settings, "UserInformation")
+                .with_child(Element::new(Page::Settings, "Get")),
+        );
+    let resp = gw.ok("Settings", &get).await;
+    let g = resp
+        .child(Page::Settings, "Oof")
+        .and_then(|o| o.child(Page::Settings, "Get"))
+        .unwrap();
+    assert_eq!(
+        g.child_text(Page::Settings, "OofState").as_deref(),
+        Some("1")
+    );
+    assert!(resp.to_xml().contains("On holiday"));
+    let xml = resp
+        .child(Page::Settings, "UserInformation")
+        .unwrap()
+        .to_xml();
+    assert!(
+        xml.contains("<PrimarySmtpAddress>alice@example.org</PrimarySmtpAddress>"),
+        "{xml}"
+    );
+    assert!(!xml.contains("*@"), "{xml}");
+
+    // Search: free text across all folders, then limited to the inbox.
+    let search = |collection: Option<&str>| {
+        let mut and = Element::new(Page::Search, "And")
+            .with_child(t(Page::AirSync, "Class", "Email"))
+            .with_child(t(Page::Search, "FreeText", "invoice"));
+        if let Some(c) = collection {
+            and.push(t(Page::AirSync, "CollectionId", c));
+        }
+        Element::new(Page::Search, "Search").with_child(
+            Element::new(Page::Search, "Store")
+                .with_child(t(Page::Search, "Name", "Mailbox"))
+                .with_child(Element::new(Page::Search, "Query").with_child(and))
+                .with_child(Element::new(Page::Search, "Options").with_child(t(
+                    Page::Search,
+                    "Range",
+                    "0-9",
+                ))),
+        )
+    };
+    let store_of = |resp: &Element| {
+        resp.child(Page::Search, "Response")
+            .unwrap()
+            .child(Page::Search, "Store")
+            .unwrap()
+            .clone()
+    };
+    let resp = gw.ok("Search", &search(None)).await;
+    let store = store_of(&resp);
+    assert_eq!(
+        store.child_text(Page::Search, "Total").as_deref(),
+        Some("2")
+    );
+    let results: Vec<_> = store.children_named(Page::Search, "Result").collect();
+    assert_eq!(
+        results[0].child_text(Page::Search, "LongId").as_deref(),
+        Some("inv2")
+    );
+    assert_eq!(
+        store.child_text(Page::Search, "Range").as_deref(),
+        Some("0-1")
+    );
+    let resp = gw.ok("Search", &search(Some(&inbox))).await;
+    let store = store_of(&resp);
+    assert_eq!(
+        store.child_text(Page::Search, "Total").as_deref(),
+        Some("1")
+    );
+    let r = store.child(Page::Search, "Result").unwrap();
+    assert_eq!(
+        r.child_text(Page::AirSync, "CollectionId"),
+        Some(inbox.clone())
+    );
+    assert_eq!(
+        r.child(Page::Search, "Properties")
+            .unwrap()
+            .child_text(Page::Email, "Subject")
+            .as_deref(),
+        Some("Invoice October")
+    );
+
+    // A result opens by LongId.
+    let fetch = Element::new(Page::ItemOperations, "ItemOperations").with_child(
+        Element::new(Page::ItemOperations, "Fetch")
+            .with_child(t(Page::ItemOperations, "Store", "Mailbox"))
+            .with_child(t(Page::Search, "LongId", "inv1")),
+    );
+    let resp = gw.ok("ItemOperations", &fetch).await;
+    assert!(resp.to_xml().contains("Invoice October"));
+}
+
+fn folder_cmd(cmd: &str, fields: &[(&str, &str)]) -> Element {
+    let mut el = Element::new(Page::FolderHierarchy, cmd);
+    for (k, v) in fields {
+        el.push(t(Page::FolderHierarchy, k, v));
+    }
+    el
+}
+
+#[tokio::test]
+async fn folder_create_update_delete() {
+    let (fake, url) = start_fake().await;
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+    let resp = gw.ok("FolderSync", &folder_sync("0")).await;
+    let k0 = resp.child_text(Page::FolderHierarchy, "SyncKey").unwrap();
+    let status = |r: &Element| r.child_text(Page::FolderHierarchy, "Status").unwrap();
+
+    // Wrong key: 9.
+    let r = gw
+        .ok(
+            "FolderCreate",
+            &folder_cmd(
+                "FolderCreate",
+                &[
+                    ("SyncKey", "x"),
+                    ("ParentId", "0"),
+                    ("DisplayName", "A"),
+                    ("Type", "12"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(status(&r), "9");
+
+    // Create under the inbox.
+    let r = gw
+        .ok(
+            "FolderCreate",
+            &folder_cmd(
+                "FolderCreate",
+                &[
+                    ("SyncKey", &k0),
+                    ("ParentId", &inbox),
+                    ("DisplayName", "Receipts"),
+                    ("Type", "12"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(status(&r), "1");
+    let k1 = r.child_text(Page::FolderHierarchy, "SyncKey").unwrap();
+    let id = r.child_text(Page::FolderHierarchy, "ServerId").unwrap();
+    assert!(fake
+        .lock()
+        .unwrap()
+        .mailboxes
+        .iter()
+        .any(|m| m["name"] == "Receipts" && m["parentId"] == "inbox"));
+    // Same name again: 2.
+    let r = gw
+        .ok(
+            "FolderCreate",
+            &folder_cmd(
+                "FolderCreate",
+                &[
+                    ("SyncKey", &k1),
+                    ("ParentId", &inbox),
+                    ("DisplayName", "receipts"),
+                    ("Type", "12"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(status(&r), "2");
+
+    // The next FolderSync has nothing new to report.
+    let r = gw.ok("FolderSync", &folder_sync(&k1)).await;
+    assert_eq!(
+        r.child(Page::FolderHierarchy, "Changes")
+            .unwrap()
+            .child_text(Page::FolderHierarchy, "Count")
+            .as_deref(),
+        Some("0")
+    );
+
+    // Rename and move to the top.
+    let r = gw
+        .ok(
+            "FolderUpdate",
+            &folder_cmd(
+                "FolderUpdate",
+                &[
+                    ("SyncKey", &k1),
+                    ("ServerId", &id),
+                    ("ParentId", "0"),
+                    ("DisplayName", "Bills"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(status(&r), "1");
+    let k2 = r.child_text(Page::FolderHierarchy, "SyncKey").unwrap();
+    assert!(fake
+        .lock()
+        .unwrap()
+        .mailboxes
+        .iter()
+        .any(|m| m["name"] == "Bills" && m["parentId"].is_null()));
+    // The inbox can't be renamed: 3.
+    let r = gw
+        .ok(
+            "FolderUpdate",
+            &folder_cmd(
+                "FolderUpdate",
+                &[
+                    ("SyncKey", &k2),
+                    ("ServerId", &inbox),
+                    ("ParentId", "0"),
+                    ("DisplayName", "X"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(status(&r), "3");
+
+    // Delete; then the FolderSync stays quiet and a second delete is 4.
+    let r = gw
+        .ok(
+            "FolderDelete",
+            &folder_cmd("FolderDelete", &[("SyncKey", &k2), ("ServerId", &id)]),
+        )
+        .await;
+    assert_eq!(status(&r), "1");
+    let k3 = r.child_text(Page::FolderHierarchy, "SyncKey").unwrap();
+    assert!(!fake
+        .lock()
+        .unwrap()
+        .mailboxes
+        .iter()
+        .any(|m| m["name"] == "Bills"));
+    let r = gw.ok("FolderSync", &folder_sync(&k3)).await;
+    assert_eq!(
+        r.child(Page::FolderHierarchy, "Changes")
+            .unwrap()
+            .child_text(Page::FolderHierarchy, "Count")
+            .as_deref(),
+        Some("0")
+    );
+    let r = gw
+        .ok(
+            "FolderDelete",
+            &folder_cmd("FolderDelete", &[("SyncKey", &k3), ("ServerId", &id)]),
+        )
+        .await;
+    assert_eq!(status(&r), "4");
+}
+
+impl Gateway {
+    async fn admin(&self, method: &str, path: &str, token: Option<&str>) -> (StatusCode, Value) {
+        let mut req = Request::builder().method(method).uri(path);
+        if let Some(t) = token {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        let resp = self
+            .app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()));
+        (status, v)
+    }
+}
+
+#[tokio::test]
+async fn admin_api_and_metrics() {
+    let (fake, url) = start_fake().await;
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+
+    let (status, _) = gw.admin("GET", "/admin/devices", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = gw.admin("GET", "/admin/devices", Some("wrong")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, list) = gw
+        .admin(
+            "GET",
+            "/admin/devices?user=alice@example.org",
+            Some("admintoken"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list[0]["deviceId"], "DEV1");
+    assert_eq!(list[0]["provisioned"], true);
+    let id = list[0]["id"].as_i64().unwrap();
+
+    // Wipe: commands get 140, Provision hands out the wipe.
+    let (status, _) = gw
+        .admin(
+            "POST",
+            &format!("/admin/devices/{id}/wipe"),
+            Some("admintoken"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let resp = gw.ok("Sync", &sync("1-x", &inbox, None, vec![])).await;
+    assert_eq!(
+        resp.child_text(Page::AirSync, "Status").as_deref(),
+        Some("140")
+    );
+    let resp = gw.ok("Provision", &provision_request(None)).await;
+    assert!(resp.child(Page::Provision, "RemoteWipe").is_some());
+
+    // Deleting the device cancels the wipe; it registers again unprovisioned.
+    let (status, _) = gw
+        .admin(
+            "DELETE",
+            &format!("/admin/devices/{id}"),
+            Some("admintoken"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let resp = gw.ok("FolderSync", &folder_sync("0")).await;
+    assert_eq!(
+        resp.child_text(Page::FolderHierarchy, "Status").as_deref(),
+        Some("142")
+    );
+    let (status, _) = gw
+        .admin("POST", "/admin/devices/99999/block", Some("admintoken"))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, text) = gw.admin("GET", "/metrics", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = text.as_str().unwrap().to_string();
+    assert!(
+        text.contains("eas_requests_total{command=\"Sync\",status=\"200\"}"),
+        "{text}"
+    );
+    assert!(text.contains("eas_devices 1"), "{text}");
+}
+
+fn contact_data(fields: &[(&str, &str)]) -> Element {
+    let mut d = Element::new(Page::AirSync, "ApplicationData");
+    for (k, v) in fields {
+        d.push(t(Page::Contacts, k, v));
+    }
+    d
+}
+
+#[tokio::test]
+async fn contacts_sync_both_ways() {
+    let (fake, url) = start_fake().await;
+    fake.lock().unwrap().cards.push(json!({
+        "id": "card1", "@type": "Card", "addressBookIds": {"ab-personal": true},
+        "name": {"components": [{"kind": "given", "value": "Ada"}, {"kind": "surname", "value": "Lovelace"}]},
+        "phones": {"p1": {"number": "+1 555 0100", "features": {"mobile": true}}},
+        "emails": {"e1": {"address": "ada@example.org"}, "e2": {"address": "ada@two.example"}, "e3": {"address": "x@3"}, "e4": {"address": "kept@4"}},
+        "notes": {"n1": {"note": "Engine notes"}}
+    }));
+    let (gw, _) = synced_gateway(&fake, &url).await;
+    let resp = gw.ok("FolderSync", &folder_sync("0")).await;
+    let adds: Vec<Element> = resp
+        .child(Page::FolderHierarchy, "Changes")
+        .unwrap()
+        .children_named(Page::FolderHierarchy, "Add")
+        .cloned()
+        .collect();
+    let contacts = adds
+        .iter()
+        .find(|a| a.child_text(Page::FolderHierarchy, "Type").as_deref() == Some("9"))
+        .expect("default contacts folder");
+    assert_eq!(
+        contacts
+            .child_text(Page::FolderHierarchy, "DisplayName")
+            .as_deref(),
+        Some("Personal")
+    );
+    assert!(adds
+        .iter()
+        .any(|a| a.child_text(Page::FolderHierarchy, "Type").as_deref() == Some("14")));
+    let cid = contacts
+        .child_text(Page::FolderHierarchy, "ServerId")
+        .unwrap();
+
+    let k = key_of(collection(
+        &gw.ok("Sync", &sync("0", &cid, None, vec![])).await,
+    ));
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![])).await;
+    let coll = collection(&resp).clone();
+    let k = key_of(&coll);
+    let add = commands(&coll, "Add")[0].clone();
+    let sid = add.child_text(Page::AirSync, "ServerId").unwrap();
+    let data = add.child(Page::AirSync, "ApplicationData").unwrap();
+    assert_eq!(
+        data.child_text(Page::Contacts, "FileAs").as_deref(),
+        Some("Lovelace, Ada")
+    );
+    assert_eq!(
+        data.child_text(Page::Contacts, "MobilePhoneNumber")
+            .as_deref(),
+        Some("+1 555 0100")
+    );
+
+    // The device edits the mobile number and sends back everything else.
+    let mut changed = data.clone();
+    changed
+        .children
+        .retain(|n| !matches!(n, eas_wbxml::Node::Element(e) if e.name() == "MobilePhoneNumber"));
+    changed.push(t(Page::Contacts, "MobilePhoneNumber", "+1 555 0199"));
+    let change = Element::new(Page::AirSync, "Change")
+        .with_child(t(Page::AirSync, "ServerId", &sid))
+        .with_child(changed);
+    // And adds a new contact.
+    let new = Element::new(Page::AirSync, "Add")
+        .with_child(t(Page::AirSync, "ClientId", "n1"))
+        .with_child(contact_data(&[
+            ("FirstName", "Grace"),
+            ("LastName", "Hopper"),
+            ("Email1Address", "grace@example.org"),
+        ]));
+    let resp = gw
+        .ok("Sync", &sync(&k, &cid, None, vec![change, new.clone()]))
+        .await;
+    let coll = collection(&resp).clone();
+    assert!(
+        coll.child(Page::AirSync, "Commands").is_none(),
+        "no echo: {}",
+        coll.to_xml()
+    );
+    let r = coll.child(Page::AirSync, "Responses").unwrap();
+    let added = r.child(Page::AirSync, "Add").unwrap();
+    assert_eq!(
+        added.child_text(Page::AirSync, "Status").as_deref(),
+        Some("1")
+    );
+    let new_sid = added.child_text(Page::AirSync, "ServerId").unwrap();
+    let k = key_of(&coll);
+    {
+        let f = fake.lock().unwrap();
+        let ada = f.cards.iter().find(|c| c["id"] == "card1").unwrap();
+        assert_eq!(ada["phones"]["p1"]["number"], json!("+1 555 0199"));
+        assert_eq!(
+            ada["emails"]["e4"]["address"],
+            json!("kept@4"),
+            "fourth email untouched"
+        );
+        assert_eq!(ada["notes"]["n1"]["note"], json!("Engine notes"));
+        let grace = f
+            .cards
+            .iter()
+            .find(|c| c["name"]["full"] == "Grace Hopper")
+            .unwrap();
+        assert_eq!(grace["addressBookIds"], json!({"ab-personal": true}));
+    }
+
+    // The same ClientId again doesn't create a second card.
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![new])).await;
+    let coll = collection(&resp).clone();
+    let again = coll
+        .child(Page::AirSync, "Responses")
+        .unwrap()
+        .child(Page::AirSync, "Add")
+        .unwrap()
+        .clone();
+    assert_eq!(again.child_text(Page::AirSync, "ServerId"), Some(new_sid));
+    assert_eq!(fake.lock().unwrap().cards.len(), 2);
+    let k = key_of(&coll);
+
+    // A server-side edit reaches the device as a full Change.
+    {
+        let mut f = fake.lock().unwrap();
+        f.cards[0]["notes"]["n1"]["note"] = json!("Updated notes");
+        f.bump("card1");
+    }
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![])).await;
+    let coll = collection(&resp).clone();
+    let ch = commands(&coll, "Change");
+    assert_eq!(ch.len(), 1);
+    assert!(ch[0].to_xml().contains("Updated notes"));
+    let k = key_of(&coll);
+
+    // Device delete destroys the card.
+    let del = Element::new(Page::AirSync, "Delete").with_child(t(Page::AirSync, "ServerId", &sid));
+    gw.ok("Sync", &sync(&k, &cid, None, vec![del])).await;
+    assert!(!fake
+        .lock()
+        .unwrap()
+        .cards
+        .iter()
+        .any(|c| c["id"] == "card1"));
+}
+
+fn cal(name: &str, v: &str) -> Element {
+    Element::new(Page::Calendar, name).with_text(v)
+}
+
+#[tokio::test]
+async fn calendar_sync_and_meeting_response() {
+    let (fake, url) = start_fake().await;
+    fake.lock().unwrap().events.push(json!({
+        "id": "ev1", "@type": "Event", "uid": "meet-1@example.org",
+        "calendarIds": {"cal-work": true},
+        "title": "Planning", "start": "2026-10-20T14:00:00", "timeZone": "Europe/Berlin", "duration": "PT1H",
+        "organizerCalendarAddress": "mailto:bob@example.org",
+        "participants": {
+            "o": {"calendarAddress": "mailto:bob@example.org", "name": "Bob", "roles": {"owner": true}},
+            "me": {"calendarAddress": "mailto:alice@example.org", "roles": {"attendee": true}, "participationStatus": "needs-action", "expectReply": true}
+        }
+    }));
+    let (gw, _) = synced_gateway(&fake, &url).await;
+    let resp = gw.ok("FolderSync", &folder_sync("0")).await;
+    let calendar = resp
+        .child(Page::FolderHierarchy, "Changes")
+        .unwrap()
+        .children_named(Page::FolderHierarchy, "Add")
+        .find(|a| a.child_text(Page::FolderHierarchy, "Type").as_deref() == Some("8"))
+        .expect("default calendar folder")
+        .clone();
+    let cid = calendar
+        .child_text(Page::FolderHierarchy, "ServerId")
+        .unwrap();
+
+    let k = key_of(collection(
+        &gw.ok("Sync", &sync("0", &cid, None, vec![])).await,
+    ));
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![])).await;
+    let coll = collection(&resp).clone();
+    let add = commands(&coll, "Add")[0].clone();
+    let sid = add.child_text(Page::AirSync, "ServerId").unwrap();
+    let data = add.child(Page::AirSync, "ApplicationData").unwrap();
+    assert_eq!(
+        data.child_text(Page::Calendar, "Subject").as_deref(),
+        Some("Planning")
+    );
+    assert_eq!(
+        data.child_text(Page::Calendar, "StartTime").as_deref(),
+        Some("20261020T120000Z")
+    );
+    assert_eq!(
+        data.child_text(Page::Calendar, "MeetingStatus").as_deref(),
+        Some("3")
+    );
+    assert_eq!(
+        data.child_text(Page::Calendar, "ResponseType").as_deref(),
+        Some("5")
+    );
+
+    // An invitation mail for the same meeting carries its details.
+    let ics = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:meet-1@example.org\r\nDTSTART:20261020T120000Z\r\nDTEND:20261020T130000Z\r\nSUMMARY:Planning\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    {
+        let mut f = fake.lock().unwrap();
+        f.add("inv", "inbox", "2026-10-15T10:00:00Z");
+        f.email("inv")["attachments"] =
+            json!([{"blobId": "ics1", "type": "text/calendar", "size": ics.len()}]);
+        f.blobs.insert("ics1".into(), ics.as_bytes().to_vec());
+        let mime = format!("From: bob@example.org\r\nSubject: Invitation\r\nMIME-Version: 1.0\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\n{ics}");
+        f.blobs.insert("blob-inv".into(), mime.into_bytes());
+    }
+    let folders = gw.ok("FolderSync", &folder_sync("0")).await;
+    let inbox_id = folders
+        .child(Page::FolderHierarchy, "Changes")
+        .unwrap()
+        .children_named(Page::FolderHierarchy, "Add")
+        .find(|a| a.child_text(Page::FolderHierarchy, "Type").as_deref() == Some("2"))
+        .unwrap()
+        .child_text(Page::FolderHierarchy, "ServerId")
+        .unwrap();
+    // FolderSync 0 reset sync state; prime both folders again.
+    let ik = key_of(collection(
+        &gw.ok("Sync", &sync("0", &inbox_id, None, vec![])).await,
+    ));
+    let resp = gw.ok("Sync", &sync(&ik, &inbox_id, None, vec![])).await;
+    let mail = commands(collection(&resp), "Add")
+        .into_iter()
+        .find(|a| {
+            a.child_text(Page::AirSync, "ServerId")
+                .unwrap()
+                .ends_with(":inv")
+        })
+        .unwrap()
+        .clone();
+    let md = mail.child(Page::AirSync, "ApplicationData").unwrap();
+    assert_eq!(
+        md.child_text(Page::Email, "MessageClass").as_deref(),
+        Some("IPM.Schedule.Meeting.Request")
+    );
+    let req = md.child(Page::Email, "MeetingRequest").unwrap();
+    assert_eq!(
+        req.child_text(Page::Email, "Organizer").as_deref(),
+        Some("bob@example.org")
+    );
+    assert!(req.child(Page::Email, "GlobalObjId").is_some());
+    let k = key_of(collection(
+        &gw.ok("Sync", &sync("0", &cid, None, vec![])).await,
+    ));
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![])).await;
+    let k = key_of(collection(&resp));
+
+    // Tentative from the mail, then accept from the calendar.
+    let mr = Element::new(Page::MeetingResponse, "MeetingResponse").with_child(
+        Element::new(Page::MeetingResponse, "Request")
+            .with_child(t(Page::MeetingResponse, "UserResponse", "2"))
+            .with_child(t(Page::MeetingResponse, "CollectionId", &inbox_id))
+            .with_child(t(
+                Page::MeetingResponse,
+                "RequestId",
+                &format!("{inbox_id}:inv"),
+            )),
+    );
+    let resp = gw.ok("MeetingResponse", &mr).await;
+    let r = resp.child(Page::MeetingResponse, "Result").unwrap();
+    assert_eq!(
+        r.child_text(Page::MeetingResponse, "Status").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        fake.lock().unwrap().events[0]["participants"]["me"]["participationStatus"],
+        json!("tentative")
+    );
+    // The calendar sees the tentative status first.
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![])).await;
+    let k = key_of(collection(&resp));
+
+    // Accept from the calendar.
+    let mr = Element::new(Page::MeetingResponse, "MeetingResponse").with_child(
+        Element::new(Page::MeetingResponse, "Request")
+            .with_child(t(Page::MeetingResponse, "UserResponse", "1"))
+            .with_child(t(Page::MeetingResponse, "CollectionId", &cid))
+            .with_child(t(Page::MeetingResponse, "RequestId", &sid)),
+    );
+    let resp = gw.ok("MeetingResponse", &mr).await;
+    let r = resp.child(Page::MeetingResponse, "Result").unwrap();
+    assert_eq!(
+        r.child_text(Page::MeetingResponse, "Status").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        r.child_text(Page::MeetingResponse, "CalendarId"),
+        Some(sid.clone())
+    );
+    {
+        let f = fake.lock().unwrap();
+        assert_eq!(
+            f.events[0]["participants"]["me"]["participationStatus"],
+            json!("accepted")
+        );
+        assert_eq!(f.scheduling.last(), Some(&true));
+    }
+    // The device hears about its new status.
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![])).await;
+    let coll = collection(&resp).clone();
+    let ch = commands(&coll, "Change");
+    assert_eq!(ch.len(), 1);
+    assert_eq!(
+        ch[0]
+            .child(Page::AirSync, "ApplicationData")
+            .unwrap()
+            .child_text(Page::Calendar, "ResponseType")
+            .as_deref(),
+        Some("3")
+    );
+    let k = key_of(&coll);
+
+    // The device adds an all-day event, then moves it a day later.
+    let blob = eas_convert::tz::from_iana("Europe/Berlin".parse().unwrap(), 2026).encode();
+    let new = Element::new(Page::AirSync, "Add")
+        .with_child(t(Page::AirSync, "ClientId", "ev-new"))
+        .with_child(
+            Element::new(Page::AirSync, "ApplicationData")
+                .with_child(cal("TimeZone", &blob))
+                .with_child(cal("AllDayEvent", "1"))
+                .with_child(cal("StartTime", "20261223T230000Z"))
+                .with_child(cal("EndTime", "20261224T230000Z"))
+                .with_child(cal("Subject", "Christmas Eve"))
+                .with_child(cal("BusyStatus", "0")),
+        );
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![new])).await;
+    let coll = collection(&resp).clone();
+    let added = coll
+        .child(Page::AirSync, "Responses")
+        .unwrap()
+        .child(Page::AirSync, "Add")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        added.child_text(Page::AirSync, "Status").as_deref(),
+        Some("1")
+    );
+    let new_sid = added.child_text(Page::AirSync, "ServerId").unwrap();
+    assert!(
+        coll.child(Page::AirSync, "Commands").is_none(),
+        "no echo: {}",
+        coll.to_xml()
+    );
+    let k = key_of(&coll);
+    {
+        let f = fake.lock().unwrap();
+        let ev = f
+            .events
+            .iter()
+            .find(|e| e["title"] == "Christmas Eve")
+            .unwrap();
+        assert_eq!(ev["start"], json!("2026-12-24T00:00:00"));
+        assert_eq!(ev["showWithoutTime"], json!(true));
+        assert_eq!(ev["freeBusyStatus"], json!("free"));
+        assert_eq!(ev["calendarIds"], json!({"cal-work": true}));
+    }
+    let change = Element::new(Page::AirSync, "Change")
+        .with_child(t(Page::AirSync, "ServerId", &new_sid))
+        .with_child(
+            Element::new(Page::AirSync, "ApplicationData")
+                .with_child(cal("TimeZone", &blob))
+                .with_child(cal("AllDayEvent", "1"))
+                .with_child(cal("StartTime", "20261224T230000Z"))
+                .with_child(cal("EndTime", "20261225T230000Z"))
+                .with_child(cal("Subject", "Christmas Day"))
+                .with_child(cal("BusyStatus", "0")),
+        );
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![change])).await;
+    let k = key_of(collection(&resp));
+    {
+        let f = fake.lock().unwrap();
+        let ev = f
+            .events
+            .iter()
+            .find(|e| e["title"] == "Christmas Day")
+            .unwrap();
+        assert_eq!(ev["start"], json!("2026-12-25T00:00:00"));
+    }
+
+    // Device delete removes it.
+    let del =
+        Element::new(Page::AirSync, "Delete").with_child(t(Page::AirSync, "ServerId", &new_sid));
+    gw.ok("Sync", &sync(&k, &cid, None, vec![del])).await;
+    assert!(!fake
+        .lock()
+        .unwrap()
+        .events
+        .iter()
+        .any(|e| e["title"] == "Christmas Day"));
+}

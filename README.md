@@ -4,7 +4,7 @@ Exchange ActiveSync (EAS) gateway for [Stalwart](https://github.com/stalwartlabs
 
 It lets the built-in mail, calendar and contacts apps on iOS and Android (Gmail, Samsung Email) sync with a Stalwart account without installing anything. The gateway speaks EAS 14.1 and 16.1 to phones and only JMAP to Stalwart, so Stalwart runs unmodified. Desktop clients are out of scope: use Thunderbird (IMAP, CalDAV, CardDAV) directly against Stalwart.
 
-**Status: early development.** Phase 1 (protocol core) is under way; no command syncs data yet, and every EAS command currently answers `501 Not Implemented`. See [docs/PLAN.md](docs/PLAN.md) for scope, architecture, the work breakdown and the roadmap.
+**Status: early development.** Mail is complete end to end against the in-process JMAP test double: provisioning, folders, sync, push, sending, replies and forwards, attachments, moves, search and out-of-office. None of it has been tried with real phones or a real Stalwart yet. Contacts, calendars and folder management work too; commands that aren't implemented answer `501 Not Implemented`. See [docs/PLAN.md](docs/PLAN.md) for scope, architecture, the work breakdown and the roadmap.
 
 ## What works today
 
@@ -15,20 +15,44 @@ It lets the built-in mail, calendar and contacts apps on iOS and Android (Gmail,
 | `OPTIONS` | Advertises 14.0, 14.1, 16.0, 16.1 and the supported commands |
 | Authentication | Basic credentials checked by opening the user's JMAP session on Stalwart, cached for 5 minutes; client IP forwarded |
 | Autodiscover | Answers `mobilesync` requests; passes Outlook-schema requests to Stalwart |
-| Commands (`Provision`, `FolderSync`, `Sync`, `Ping`, …) | Not yet: next in the plan |
+| `Provision` | Two-step policy keys, permissive default policy, remote wipe answered and acknowledged; other commands get status 142/144/140 until provisioned |
+| `FolderSync` | Mailboxes as folders with stable short IDs, roles mapped to Inbox/Drafts/Trash/Sent, adds/updates/deletes, retry replay |
+| `Sync` (mail) | SyncKey state machine with retry replay, window size and `MoreAvailable`, filter types, plain/HTML/MIME bodies with truncation and preview, attachments listed; device read/flag changes, deletes (to Trash) and fetches; server-side adds, deletes and read/flag changes; empty (cached) requests; `Wait`/`HeartbeatInterval` held by polling until push lands |
+| `GetItemEstimate` | Mail folders |
+| State (`eas-state`) | SQLite: devices, policy keys, folder map, per-folder sync state with replay data, items |
+| Calendar | Calendars as folders (the default one as the device's Calendar); events synced both ways with time zones, all-day events, reminders, busy status, privacy, categories, attendees, recurrence (daily, weekly, monthly, nth weekday, yearly) and exceptions; calendar FilterType as a date window; device edits patch only what changed; 16.x devices get server-sent invitations |
+| `MeetingResponse` | Accept, tentative or decline from the calendar item or the invitation mail (found by UID); Stalwart sends the reply |
+| Invitation mails | Mails with a `text/calendar` part carry meeting details (`MeetingRequest`, `GlobalObjId`, meeting message class) taken from Stalwart's copy of the event or, failing that, from the invitation itself |
+| Not yet | `ResolveRecipients`, `Find`, GAL, drafts sync (16.x), responses to single occurrences, contact photos, creating contact or calendar folders from the device, tasks |
 
 ## Layout
 
 | Crate | Role |
 | --- | --- |
 | `crates/eas-wbxml` | WBXML tokens, code pages, encoder and decoder |
-| `crates/eas-proto` | Versions, commands, request lines, OPTIONS, autodiscover; typed messages next |
-| `crates/eas-jmap` | JMAP session (done), batched calls, changes, blobs, EventSource (next) |
-| `crates/eas-convert` | Email, JSCalendar, JSContact mapping (phases 2–4) |
-| `crates/eas-state` | Device and sync state in SQLite (phase 1) |
-| `crates/eas-server` | The `stalwart-activesync` binary: HTTP, auth, dispatch |
+| `crates/eas-proto` | Versions, commands, request lines, OPTIONS, autodiscover, status codes, the policy document |
+| `crates/eas-jmap` | JMAP session, batched calls, method errors, blobs, per-user concurrency limit, EventSource, mail, submission and vacation helpers |
+| `crates/eas-convert` | Email items, read/flag patches, outgoing MIME (envelope, Bcc, smart reply/forward), JSContact cards, JSCalendar events, Windows time zone blobs |
+| `crates/eas-state` | Device and sync state in SQLite |
+| `crates/eas-server` | The `stalwart-activesync` binary: HTTP, auth, policy checks, command handlers |
 
 ## Running
+
+For a complete local or server test setup (Stalwart, this gateway, Bulwark webmail and Caddy) see [deploy/README.md](deploy/README.md): `docker compose up`, one bootstrap script for a domain and test users, and a probe that plays a phone.
+
+`stalwart-activesync probe <https://mail.example.org> <user> <password> [--insecure]` checks any deployment end to end: OPTIONS, Provision, FolderSync, and a first Sync of the inbox, contacts and calendar.
+
+Images are built by GitHub Actions and pushed to the GitHub Container Registry: `ghcr.io/business-box/stalwart-activesync`, tagged with the branch name, the short commit SHA, `latest` for the default branch and the version for `v*` tags.
+
+```sh
+docker run -d --name stalwart-activesync \
+  -e STALWART_URL=http://stalwart:8080 \
+  -e EAS_PUBLIC_URL=https://mail.example.org \
+  -v eas-data:/data -p 8080:8080 \
+  ghcr.io/business-box/stalwart-activesync:latest
+```
+
+From source:
 
 ```sh
 STALWART_URL=http://stalwart:8080 \
@@ -44,7 +68,27 @@ cargo run --release -p eas-server
 | `EAS_TRUST_FORWARDED` | `true` | Take the client IP from `X-Forwarded-For` (only behind a reverse proxy) |
 | `EAS_MAX_BODY_MB` | `50` | Largest request body |
 | `EAS_AUTH_CACHE_SECS` | `300` | How long a successful login is reused |
+| `EAS_DB_URL` | `sqlite://eas.db` | State database (`sqlite:///data/eas.db` in the container image) |
+| `EAS_REQUIRE_PROVISIONING` | `true` | Refuse commands from devices without a policy key; remote wipe needs it |
+| `EAS_ADMIN_TOKEN` | unset | Bearer token for the admin API; the API is off without it |
+| `STALWART_REWRITE_URLS` | `true` | Reach the JMAP API, blobs and push at `STALWART_URL` even though Stalwart's session names its public `https://` hostname |
 | `RUST_LOG` | `info` | Log filter; `debug` logs decoded request bodies (opaque data is never logged) |
+
+### Admin API and metrics
+
+With `EAS_ADMIN_TOKEN` set, the gateway serves a small admin API on its own port. Don't route `/admin` or `/metrics` through the public proxy.
+
+```sh
+T="Authorization: Bearer $EAS_ADMIN_TOKEN"
+curl -H "$T" http://gateway:8080/admin/devices                      # all devices
+curl -H "$T" 'http://gateway:8080/admin/devices?user=alice@example.org'
+curl -H "$T" -X POST http://gateway:8080/admin/devices/7/reset     # re-provision and resync from scratch
+curl -H "$T" -X POST http://gateway:8080/admin/devices/7/block     # or /unblock
+curl -H "$T" -X POST http://gateway:8080/admin/devices/7/wipe      # remote wipe on next contact
+curl -H "$T" -X DELETE http://gateway:8080/admin/devices/7         # forget the device (cancels a wipe)
+```
+
+`GET /metrics` serves Prometheus counters for requests by command and status, time spent per command, waiting `Ping`/`Sync` requests and the number of known devices.
 
 ### Caddy
 
@@ -76,6 +120,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
+
+`crates/eas-server/src/e2e_tests.rs` drives real WBXML requests through the router against a small fake of Stalwart's JMAP API (session, mailboxes, email query/get/changes/set/import, submission, identities, vacation response, blob upload and download, EventSource), so the sync logic is tested without a running Stalwart.
 
 The code page tables in `crates/eas-wbxml/src/codepages.rs` are generated by `tools/gen_codepages.py` from [go-activesync](https://github.com/hstern/go-activesync) (MIT, official MS-ASWBXML names) and [Z-Push](https://github.com/Z-Hub/Z-Push) (AGPL-3.0, for tokens the former lacks).
 
