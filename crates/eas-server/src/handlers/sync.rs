@@ -303,10 +303,76 @@ pub(super) async fn serialise(
         } else {
             None
         };
-        let data = email::application_data(&e, opts, mime.as_deref());
+        let meeting = meeting_details(ctx, &e).await;
+        let data = email::application_data(&e, opts, mime.as_deref(), meeting.as_ref());
         out.push((id.clone(), e, data));
     }
     Ok(out)
+}
+
+/// Invitation details for an email with a `text/calendar` part. Failures
+/// only cost the details, never the mail.
+async fn meeting_details(ctx: &Ctx<'_>, email: &Value) -> Option<email::Meeting> {
+    let part = email
+        .get("attachments")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|a| {
+            a.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.eq_ignore_ascii_case("text/calendar"))
+        })?;
+    let blob = part.get("blobId").and_then(Value::as_str)?;
+    let size = part.get("size").and_then(Value::as_u64).unwrap_or(0);
+    if size > 1024 * 1024 {
+        return None;
+    }
+    let raw = match ctx.jmap.download(blob, "invite.ics").await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, "invitation part unavailable");
+            return None;
+        }
+    };
+    let inv = eas_convert::ics::parse(&String::from_utf8_lossy(&raw))?;
+    let class = inv.message_class();
+    if !matches!(inv.method.as_str(), "REQUEST" | "CANCEL" | "") {
+        return Some(email::Meeting {
+            message_class: class,
+            request: None,
+        });
+    }
+    // Stalwart's copy of the event knows the time zone and recurrence.
+    let mut event = None;
+    if let Some(account) = ctx.jmap.session().calendars() {
+        if let Ok(ids) = ctx
+            .jmap
+            .query_ids(
+                "CalendarEvent",
+                account,
+                json!({ "uid": inv.uid }),
+                Map::new(),
+                1,
+            )
+            .await
+        {
+            if let Ok(found) = ctx
+                .jmap
+                .get("CalendarEvent", account, &ids, &json!({}))
+                .await
+            {
+                event = found
+                    .first()
+                    .and_then(eas_convert::calendar::EasEvent::from_jmap);
+            }
+        }
+    }
+    let ev = event.or_else(|| inv.to_event())?;
+    let recurring = inv.recurring || ev.recurrence.is_some();
+    Some(email::Meeting {
+        message_class: class,
+        request: Some(email::meeting_request(&ev, recurring, ctx.version.is_16())),
+    })
 }
 
 /// [`serialise`] for any class.

@@ -283,7 +283,8 @@ The deciding facts come from Stalwart's own repo and support portal: no EAS plan
 - [x] Folder create/update/delete for mail; admin API and metrics.
 - [x] Phase 4 core: contacts (address books, cards both ways, ghosting-safe patches).
 - [x] Phase 3 core: calendar (events both ways, time zones, recurrence, exceptions, attendees, MeetingResponse).
-- [ ] Meeting details in invitation mails, single-occurrence responses, GAL and ResolveRecipients.
+- [x] Meeting details in invitation mails.
+- [ ] Single-occurrence responses, GAL and ResolveRecipients, contact photos, tasks.
 
 ## Sources
 

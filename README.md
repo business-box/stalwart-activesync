@@ -22,7 +22,8 @@ It lets the built-in mail, calendar and contacts apps on iOS and Android (Gmail,
 | State (`eas-state`) | SQLite: devices, policy keys, folder map, per-folder sync state with replay data, items |
 | Calendar | Calendars as folders (the default one as the device's Calendar); events synced both ways with time zones, all-day events, reminders, busy status, privacy, categories, attendees, recurrence (daily, weekly, monthly, nth weekday, yearly) and exceptions; calendar FilterType as a date window; device edits patch only what changed; 16.x devices get server-sent invitations |
 | `MeetingResponse` | Accept, tentative or decline from the calendar item or the invitation mail (found by UID); Stalwart sends the reply |
-| Not yet | `ResolveRecipients`, `Find`, GAL, drafts sync (16.x), meeting-request details in invitation mails, responses to single occurrences, contact photos, creating contact or calendar folders from the device, tasks |
+| Invitation mails | Mails with a `text/calendar` part carry meeting details (`MeetingRequest`, `GlobalObjId`, meeting message class) taken from Stalwart's copy of the event or, failing that, from the invitation itself |
+| Not yet | `ResolveRecipients`, `Find`, GAL, drafts sync (16.x), responses to single occurrences, contact photos, creating contact or calendar folders from the device, tasks |
 
 ## Layout
 

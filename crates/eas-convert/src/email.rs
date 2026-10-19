@@ -366,9 +366,82 @@ pub fn parse_file_reference(r: &str) -> Option<(&str, &str)> {
         .filter(|(e, b)| !e.is_empty() && !b.is_empty())
 }
 
+/// Meeting details for an invitation mail: its message class and, for
+/// requests and cancellations, the `MeetingRequest` element.
+#[derive(Debug, Clone)]
+pub struct Meeting {
+    pub message_class: &'static str,
+    pub request: Option<Element>,
+}
+
+/// `GlobalObjId` (MS-ASEMAIL 2.2.2.42): Outlook's object ID wrapping the
+/// iCalendar UID, which devices use to tie the mail to the calendar item.
+pub fn global_obj_id(uid: &str) -> String {
+    use base64::Engine as _;
+    let mut data = b"vCal-Uid".to_vec();
+    data.extend_from_slice(&[1, 0, 0, 0]);
+    data.extend_from_slice(uid.as_bytes());
+    data.push(0);
+    let mut b = vec![
+        0x04, 0x00, 0x00, 0x00, 0x82, 0x00, 0xE0, 0x00, 0x74, 0xC5, 0xB7, 0x10, 0x1A, 0x82, 0xE0,
+        0x08,
+    ];
+    // Instance date, creation time and reserved bytes: zero for the series.
+    b.extend_from_slice(&[0u8; 4 + 8 + 8]);
+    b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    b.extend_from_slice(&data);
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
+/// The `MeetingRequest` element for an invitation.
+pub fn meeting_request(ev: &crate::calendar::EasEvent, recurring: bool, v16: bool) -> Element {
+    let date = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let e = |name: &str, v: String| Element::new(Page::Email, name).with_text(v);
+    let year = {
+        use chrono::Datelike;
+        ev.start.year()
+    };
+    let mut m = Element::new(Page::Email, "MeetingRequest");
+    m.push(e("AllDayEvent", (ev.all_day as u8).to_string()));
+    m.push(e("StartTime", date(ev.start)));
+    m.push(e(
+        "DTStamp",
+        date(ev.dtstamp.unwrap_or_else(chrono::Utc::now)),
+    ));
+    m.push(e("EndTime", date(ev.end)));
+    m.push(e("InstanceType", if recurring { "1" } else { "0" }.into()));
+    if let Some(l) = &ev.location {
+        m.push(e("Location", l.clone()));
+    }
+    if let Some((_, org)) = &ev.organizer {
+        m.push(e("Organizer", org.clone()));
+    }
+    if let Some(r) = ev.reminder {
+        m.push(e("Reminder", r.to_string()));
+    }
+    m.push(e("ResponseRequested", "1".into()));
+    m.push(e("Sensitivity", ev.sensitivity.to_string()));
+    m.push(e("BusyStatus", ev.busy.to_string()));
+    m.push(e("TimeZone", crate::tz::info_for(ev.tz, year).encode()));
+    if let Some(uid) = &ev.uid {
+        m.push(e("GlobalObjId", global_obj_id(uid)));
+    }
+    m.push(e("DisallowNewTimeProposal", "0".into()));
+    if v16 {
+        m.push(Element::new(Page::Email2, "MeetingMessageType").with_text("1"));
+    }
+    m
+}
+
 /// The `ApplicationData` of an email item. `mime` must hold the full
-/// message when the chosen body type is MIME.
-pub fn application_data(email: &Value, options: &BodyOptions, mime: Option<&[u8]>) -> Element {
+/// message when the chosen body type is MIME; `meeting` adds invitation
+/// details.
+pub fn application_data(
+    email: &Value,
+    options: &BodyOptions,
+    mime: Option<&[u8]>,
+    meeting: Option<&Meeting>,
+) -> Element {
     let pref = options.chosen();
     let mut d = Element::new(Page::AirSync, "ApplicationData");
     let e = |name: &str, text: String| Element::new(Page::Email, name).with_text(text);
@@ -409,7 +482,16 @@ pub fn application_data(email: &Value, options: &BodyOptions, mime: Option<&[u8]
         }
     }
     d.push(body_element(email, &pref, mime));
-    d.push(e("MessageClass", "IPM.Note".into()));
+    if let Some(req) = meeting.and_then(|m| m.request.clone()) {
+        d.push(req);
+    }
+    d.push(e(
+        "MessageClass",
+        meeting
+            .map(|m| m.message_class)
+            .unwrap_or("IPM.Note")
+            .into(),
+    ));
     d.push(e("InternetCPID", "65001".into()));
     let mut flag = Element::new(Page::Email, "Flag");
     if keyword(email, "$flagged") {
@@ -531,7 +613,7 @@ mod tests {
 
     #[test]
     fn serialises_core_fields() {
-        let d = application_data(&sample(), &html_opts(None), None);
+        let d = application_data(&sample(), &html_opts(None), None, None);
         assert_eq!(
             d.child_text(Page::Email, "From").as_deref(),
             Some("\"Alice\" <alice@example.org>")
@@ -582,7 +664,7 @@ mod tests {
 
     #[test]
     fn truncates_and_falls_back_to_text() {
-        let d = application_data(&sample(), &html_opts(Some(8)), None);
+        let d = application_data(&sample(), &html_opts(Some(8)), None, None);
         let body = d.child(Page::AirSyncBase, "Body").unwrap();
         assert_eq!(
             body.child_text(Page::AirSyncBase, "Truncated").as_deref(),
@@ -604,7 +686,7 @@ mod tests {
         };
         let mut html_only = sample();
         html_only["textBody"] = json!([{"partId": "2", "type": "text/html"}]);
-        let d = application_data(&html_only, &plain, None);
+        let d = application_data(&html_only, &plain, None, None);
         let body = d.child(Page::AirSyncBase, "Body").unwrap();
         assert_eq!(
             body.child_text(Page::AirSyncBase, "Data").as_deref(),
@@ -626,7 +708,7 @@ mod tests {
         };
         assert!(opts.needs_mime());
         assert!(!html_opts(None).needs_mime());
-        let d = application_data(&sample(), &opts, Some(b"Subject: x\r\n\r\nhi"));
+        let d = application_data(&sample(), &opts, Some(b"Subject: x\r\n\r\nhi"), None);
         assert!(d.child(Page::AirSyncBase, "Attachments").is_none());
         let body = d.child(Page::AirSyncBase, "Body").unwrap();
         assert_eq!(
@@ -660,6 +742,42 @@ mod tests {
             .with_child(Element::new(Page::Email, "Read").with_text("1"));
         let p = change_patch(&only_read);
         assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn invitation_details() {
+        let inv = crate::ics::parse("BEGIN:VCALENDAR\nMETHOD:REQUEST\nBEGIN:VEVENT\nUID:u1\nDTSTART:20261020T120000Z\nDTEND:20261020T130000Z\nORGANIZER:mailto:bob@example.org\nEND:VEVENT\nEND:VCALENDAR\n").unwrap();
+        let meeting = Meeting {
+            message_class: inv.message_class(),
+            request: Some(meeting_request(
+                &inv.to_event().unwrap(),
+                inv.recurring,
+                true,
+            )),
+        };
+        let d = application_data(&sample(), &html_opts(None), None, Some(&meeting));
+        assert_eq!(
+            d.child_text(Page::Email, "MessageClass").as_deref(),
+            Some("IPM.Schedule.Meeting.Request")
+        );
+        let m = d.child(Page::Email, "MeetingRequest").unwrap();
+        assert_eq!(
+            m.child_text(Page::Email, "StartTime").as_deref(),
+            Some("2026-10-20T12:00:00.000Z")
+        );
+        assert_eq!(
+            m.child_text(Page::Email, "Organizer").as_deref(),
+            Some("bob@example.org")
+        );
+        let bytes = eas_wbxml::encode(&d);
+        assert_eq!(eas_wbxml::decode(&bytes).unwrap(), d);
+        // The UID sits after the fixed 40-byte header and "vCal-Uid\x01\0\0\0".
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(global_obj_id("u1"))
+            .unwrap();
+        assert_eq!(&raw[..4], &[4, 0, 0, 0]);
+        assert_eq!(&raw[52..54], b"u1");
     }
 
     #[test]

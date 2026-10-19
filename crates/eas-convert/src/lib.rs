@@ -11,5 +11,6 @@ pub mod calendar;
 pub mod compose;
 pub mod contact;
 pub mod email;
+pub mod ics;
 pub mod text;
 pub mod tz;

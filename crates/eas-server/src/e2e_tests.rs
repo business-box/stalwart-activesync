@@ -455,7 +455,20 @@ async fn start_fake() -> (Shared, String) {
         .route("/jmap", post(api))
         .route(
             "/download/{acc}/{blob}/{name}",
-            get(|| async { "Subject: raw\r\n\r\nraw body" }),
+            get(
+                |State(st): State<(Shared, SocketAddr)>,
+                 axum::extract::Path((_, blob, _)): axum::extract::Path<(
+                    String,
+                    String,
+                    String,
+                )>| async move {
+                    let f = st.0.lock().unwrap();
+                    f.blobs
+                        .get(&blob)
+                        .cloned()
+                        .unwrap_or_else(|| b"Subject: raw\r\n\r\nraw body".to_vec())
+                },
+            ),
         )
         .route("/es", get(event_source))
         .route(
@@ -1825,7 +1838,6 @@ async fn calendar_sync_and_meeting_response() {
     ));
     let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![])).await;
     let coll = collection(&resp).clone();
-    let k = key_of(&coll);
     let add = commands(&coll, "Add")[0].clone();
     let sid = add.child_text(Page::AirSync, "ServerId").unwrap();
     let data = add.child(Page::AirSync, "ApplicationData").unwrap();
@@ -1845,6 +1857,82 @@ async fn calendar_sync_and_meeting_response() {
         data.child_text(Page::Calendar, "ResponseType").as_deref(),
         Some("5")
     );
+
+    // An invitation mail for the same meeting carries its details.
+    let ics = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:meet-1@example.org\r\nDTSTART:20261020T120000Z\r\nDTEND:20261020T130000Z\r\nSUMMARY:Planning\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    {
+        let mut f = fake.lock().unwrap();
+        f.add("inv", "inbox", "2026-10-15T10:00:00Z");
+        f.email("inv")["attachments"] =
+            json!([{"blobId": "ics1", "type": "text/calendar", "size": ics.len()}]);
+        f.blobs.insert("ics1".into(), ics.as_bytes().to_vec());
+        let mime = format!("From: bob@example.org\r\nSubject: Invitation\r\nMIME-Version: 1.0\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\n{ics}");
+        f.blobs.insert("blob-inv".into(), mime.into_bytes());
+    }
+    let folders = gw.ok("FolderSync", &folder_sync("0")).await;
+    let inbox_id = folders
+        .child(Page::FolderHierarchy, "Changes")
+        .unwrap()
+        .children_named(Page::FolderHierarchy, "Add")
+        .find(|a| a.child_text(Page::FolderHierarchy, "Type").as_deref() == Some("2"))
+        .unwrap()
+        .child_text(Page::FolderHierarchy, "ServerId")
+        .unwrap();
+    // FolderSync 0 reset sync state; prime both folders again.
+    let ik = key_of(collection(
+        &gw.ok("Sync", &sync("0", &inbox_id, None, vec![])).await,
+    ));
+    let resp = gw.ok("Sync", &sync(&ik, &inbox_id, None, vec![])).await;
+    let mail = commands(collection(&resp), "Add")
+        .into_iter()
+        .find(|a| {
+            a.child_text(Page::AirSync, "ServerId")
+                .unwrap()
+                .ends_with(":inv")
+        })
+        .unwrap()
+        .clone();
+    let md = mail.child(Page::AirSync, "ApplicationData").unwrap();
+    assert_eq!(
+        md.child_text(Page::Email, "MessageClass").as_deref(),
+        Some("IPM.Schedule.Meeting.Request")
+    );
+    let req = md.child(Page::Email, "MeetingRequest").unwrap();
+    assert_eq!(
+        req.child_text(Page::Email, "Organizer").as_deref(),
+        Some("bob@example.org")
+    );
+    assert!(req.child(Page::Email, "GlobalObjId").is_some());
+    let k = key_of(collection(
+        &gw.ok("Sync", &sync("0", &cid, None, vec![])).await,
+    ));
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![])).await;
+    let k = key_of(collection(&resp));
+
+    // Tentative from the mail, then accept from the calendar.
+    let mr = Element::new(Page::MeetingResponse, "MeetingResponse").with_child(
+        Element::new(Page::MeetingResponse, "Request")
+            .with_child(t(Page::MeetingResponse, "UserResponse", "2"))
+            .with_child(t(Page::MeetingResponse, "CollectionId", &inbox_id))
+            .with_child(t(
+                Page::MeetingResponse,
+                "RequestId",
+                &format!("{inbox_id}:inv"),
+            )),
+    );
+    let resp = gw.ok("MeetingResponse", &mr).await;
+    let r = resp.child(Page::MeetingResponse, "Result").unwrap();
+    assert_eq!(
+        r.child_text(Page::MeetingResponse, "Status").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        fake.lock().unwrap().events[0]["participants"]["me"]["participationStatus"],
+        json!("tentative")
+    );
+    // The calendar sees the tentative status first.
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![])).await;
+    let k = key_of(collection(&resp));
 
     // Accept from the calendar.
     let mr = Element::new(Page::MeetingResponse, "MeetingResponse").with_child(
