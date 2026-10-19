@@ -27,6 +27,7 @@ serde_json = "1"
 mail-parser = "0.11"
 mail-builder = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10"
 base64 = "0.22"
 form_urlencoded = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
