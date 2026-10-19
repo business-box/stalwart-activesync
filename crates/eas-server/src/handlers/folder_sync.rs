@@ -25,13 +25,16 @@ pub mod folder_type {
     pub const DRAFTS: u8 = 3;
     pub const TRASH: u8 = 4;
     pub const SENT: u8 = 5;
+    pub const CALENDAR: u8 = 8;
     pub const CONTACTS: u8 = 9;
     pub const USER_MAIL: u8 = 12;
+    pub const USER_CALENDAR: u8 = 13;
     pub const USER_CONTACTS: u8 = 14;
 }
 
 pub const KIND_MAILBOX: &str = "mailbox";
 pub const KIND_ADDRESS_BOOK: &str = "addressbook";
+pub const KIND_CALENDAR: &str = "calendar";
 
 fn type_for_role(role: Option<&str>) -> u8 {
     match role {
@@ -47,6 +50,7 @@ fn type_for_role(role: Option<&str>) -> u8 {
 fn user_type(kind: &str) -> u8 {
     match kind {
         KIND_ADDRESS_BOOK => folder_type::USER_CONTACTS,
+        KIND_CALENDAR => folder_type::USER_CALENDAR,
         _ => folder_type::USER_MAIL,
     }
 }
@@ -83,6 +87,20 @@ pub fn from_mailboxes(mailboxes: &[Mailbox]) -> Vec<SourceFolder> {
 /// Address books; the default one (or the first) is the device's Contacts
 /// folder.
 pub fn from_address_books(books: &[Value]) -> Vec<SourceFolder> {
+    from_collections(books, KIND_ADDRESS_BOOK, "Contacts", folder_type::CONTACTS)
+}
+
+/// Calendars; the default one (or the first) is the device's Calendar.
+pub fn from_calendars(calendars: &[Value]) -> Vec<SourceFolder> {
+    from_collections(calendars, KIND_CALENDAR, "Calendar", folder_type::CALENDAR)
+}
+
+fn from_collections(
+    books: &[Value],
+    kind: &'static str,
+    fallback_name: &str,
+    default_type: u8,
+) -> Vec<SourceFolder> {
     let default = books
         .iter()
         .position(|b| b.get("isDefault").and_then(Value::as_bool) == Some(true))
@@ -92,18 +110,18 @@ pub fn from_address_books(books: &[Value]) -> Vec<SourceFolder> {
         .enumerate()
         .filter_map(|(i, b)| {
             Some(SourceFolder {
-                kind: KIND_ADDRESS_BOOK,
+                kind,
                 id: b.get("id")?.as_str()?.to_string(),
                 name: b
                     .get("name")
                     .and_then(Value::as_str)
-                    .unwrap_or("Contacts")
+                    .unwrap_or(fallback_name)
                     .to_string(),
                 parent_id: None,
                 folder_type: if i == default {
-                    folder_type::CONTACTS
+                    default_type
                 } else {
-                    folder_type::USER_CONTACTS
+                    user_type(kind)
                 },
                 sort_order: b.get("sortOrder").and_then(Value::as_u64).unwrap_or(0) as u32,
             })
@@ -231,6 +249,18 @@ pub async fn handle(ctx: &Ctx<'_>, request: Option<Element>) -> HandlerResult {
             .await?;
         sources.extend(from_address_books(&books));
         managed.push(KIND_ADDRESS_BOOK);
+    }
+    if let Some(account) = ctx.jmap.session().calendars() {
+        let (cals, _) = ctx
+            .jmap
+            .get_all(
+                "Calendar",
+                account,
+                Some(&["id", "name", "isDefault", "sortOrder"]),
+            )
+            .await?;
+        sources.extend(from_calendars(&cals));
+        managed.push(KIND_CALENDAR);
     }
     let mut next_id = hs.as_ref().map(|h| h.next_folder_id).unwrap_or(1);
     let desired = desired_folders(&sources, &all_known, &mut next_id);

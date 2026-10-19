@@ -26,6 +26,9 @@ struct Fake {
     vacation: Value,
     mailboxes: Vec<Value>,
     cards: Vec<Value>,
+    events: Vec<Value>,
+    /// sendSchedulingMessages of each CalendarEvent/set.
+    scheduling: Vec<bool>,
     /// (identity ID, envelope, stored MIME, kept in a mailbox)
     submissions: Vec<(String, Value, Vec<u8>, bool)>,
 }
@@ -65,9 +68,14 @@ async fn session(State(addr): State<(Shared, SocketAddr)>) -> Json<Value> {
         "capabilities": {
             "urn:ietf:params:jmap:core": {"maxConcurrentRequests": 4, "maxCallsInRequest": 16},
             "urn:ietf:params:jmap:mail": {},
-            "urn:ietf:params:jmap:contacts": {}
+            "urn:ietf:params:jmap:contacts": {},
+            "urn:ietf:params:jmap:calendars": {}
         },
-        "primaryAccounts": {"urn:ietf:params:jmap:mail": "acc", "urn:ietf:params:jmap:contacts": "acc"},
+        "primaryAccounts": {
+            "urn:ietf:params:jmap:mail": "acc",
+            "urn:ietf:params:jmap:contacts": "acc",
+            "urn:ietf:params:jmap:calendars": "acc"
+        },
         "username": "alice@example.org",
         "apiUrl": format!("{base}/jmap"),
         "downloadUrl": format!("{base}/download/{{accountId}}/{{blobId}}/{{name}}?accept={{type}}"),
@@ -75,6 +83,55 @@ async fn session(State(addr): State<(Shared, SocketAddr)>) -> Json<Value> {
         "eventSourceUrl": format!("{base}/es"),
         "state": "s"
     }))
+}
+
+/// Create, update (with patch paths) and destroy on a list of objects;
+/// returns the response and the IDs that changed.
+fn object_set(list: &mut Vec<Value>, args: &Value, prefix: &str) -> (Value, Vec<String>) {
+    let mut out = json!({});
+    let mut changed = Vec::new();
+    if let Some(c) = args["create"].as_object() {
+        for (k, v) in c {
+            let id = format!("{prefix}{}", list.len() + 100);
+            let mut obj = v.clone();
+            obj["id"] = json!(id);
+            list.push(obj);
+            changed.push(id.clone());
+            out["created"][k] = json!({"id": id});
+        }
+    }
+    if let Some(u) = args["update"].as_object() {
+        for (id, patch) in u {
+            let Some(obj) = list.iter_mut().find(|c| c["id"] == id.as_str()) else {
+                out["notUpdated"][id] = json!({"type": "notFound"});
+                continue;
+            };
+            for (path, v) in patch.as_object().unwrap() {
+                let parts: Vec<&str> = path.split('/').collect();
+                let (last, parents) = parts.split_last().unwrap();
+                let mut target = &mut *obj;
+                for p in parents {
+                    target = target.get_mut(*p).expect("patch parent exists");
+                }
+                let map = target.as_object_mut().unwrap();
+                if v.is_null() {
+                    map.remove(*last);
+                } else {
+                    map.insert(last.to_string(), v.clone());
+                }
+            }
+            changed.push(id.clone());
+            out["updated"][id] = Value::Null;
+        }
+    }
+    if let Some(d) = args["destroy"].as_array() {
+        for id in d {
+            list.retain(|c| &c["id"] != id);
+            changed.push(id.as_str().unwrap().to_string());
+        }
+        out["destroyed"] = json!(d);
+    }
+    (out, changed)
 }
 
 /// The subset of JMAP email filters the gateway sends.
@@ -185,7 +242,7 @@ fn method(fake: &mut Fake, name: &str, args: &Value) -> (String, Value) {
             }
             ok(json!({"updated": {"singleton": null}}))
         }
-        "Email/changes" | "ContactCard/changes" => {
+        "Email/changes" | "ContactCard/changes" | "CalendarEvent/changes" => {
             let Ok(since) = args["sinceState"].as_str().unwrap().parse::<u64>() else {
                 return ("error".into(), json!({"type": "cannotCalculateChanges"}));
             };
@@ -291,47 +348,51 @@ fn method(fake: &mut Fake, name: &str, args: &Value) -> (String, Value) {
             ok(json!({"ids": ids}))
         }
         "ContactCard/set" => {
-            let mut out = json!({});
-            if let Some(c) = args["create"].as_object() {
-                for (k, v) in c {
-                    let id = format!("c{}", fake.cards.len() + 100);
-                    let mut card = v.clone();
-                    card["id"] = json!(id);
-                    fake.cards.push(card);
-                    fake.bump(&id);
-                    out["created"][k] = json!({"id": id});
-                }
+            let mut list = std::mem::take(&mut fake.cards);
+            let (out, changed) = object_set(&mut list, args, "c");
+            fake.cards = list;
+            for id in changed {
+                fake.bump(&id);
             }
-            if let Some(u) = args["update"].as_object() {
-                for (id, patch) in u {
-                    let Some(card) = fake.cards.iter_mut().find(|c| c["id"] == id.as_str()) else {
-                        out["notUpdated"][id] = json!({"type": "notFound"});
-                        continue;
-                    };
-                    for (path, v) in patch.as_object().unwrap() {
-                        let parts: Vec<&str> = path.split('/').collect();
-                        let (last, parents) = parts.split_last().unwrap();
-                        let mut target = &mut *card;
-                        for p in parents {
-                            target = target.get_mut(*p).expect("patch parent exists");
-                        }
-                        let map = target.as_object_mut().unwrap();
-                        if v.is_null() {
-                            map.remove(*last);
-                        } else {
-                            map.insert(last.to_string(), v.clone());
-                        }
-                    }
-                    fake.bump(id);
-                    out["updated"][id] = Value::Null;
-                }
-            }
-            if let Some(d) = args["destroy"].as_array() {
-                for id in d {
-                    fake.cards.retain(|c| &c["id"] != id);
-                    fake.bump(id.as_str().unwrap());
-                }
-                out["destroyed"] = json!(d);
+            ok(out)
+        }
+        "Calendar/get" => ok(json!({"state": "cal1", "list": [
+            {"id": "cal-work", "name": "Work", "isDefault": true}
+        ]})),
+        "CalendarEvent/get" => {
+            let ids = args["ids"].as_array().cloned().unwrap_or_default();
+            let list: Vec<Value> = fake
+                .events
+                .iter()
+                .filter(|e| ids.contains(&e["id"]))
+                .cloned()
+                .collect();
+            ok(json!({"state": fake.state.to_string(), "list": list}))
+        }
+        "CalendarEvent/query" => {
+            let ids: Vec<&Value> = fake
+                .events
+                .iter()
+                .filter(|e| match args["filter"]["inCalendar"].as_str() {
+                    Some(c) => e["calendarIds"].get(c).is_some(),
+                    None => true,
+                })
+                .filter(|e| match args["filter"]["uid"].as_str() {
+                    Some(u) => e["uid"] == u,
+                    None => true,
+                })
+                .map(|e| &e["id"])
+                .collect();
+            ok(json!({"ids": ids}))
+        }
+        "CalendarEvent/set" => {
+            fake.scheduling
+                .push(args["sendSchedulingMessages"].as_bool().unwrap_or(false));
+            let mut list = std::mem::take(&mut fake.events);
+            let (out, changed) = object_set(&mut list, args, "ev");
+            fake.events = list;
+            for id in changed {
+                fake.bump(&id);
             }
             ok(out)
         }
@@ -630,7 +691,7 @@ async fn provision_folder_sync_and_mail_sync() {
         changes
             .child_text(Page::FolderHierarchy, "Count")
             .as_deref(),
-        Some("6")
+        Some("7")
     );
     let adds: Vec<_> = changes
         .children_named(Page::FolderHierarchy, "Add")
@@ -1727,4 +1788,179 @@ async fn contacts_sync_both_ways() {
         .cards
         .iter()
         .any(|c| c["id"] == "card1"));
+}
+
+fn cal(name: &str, v: &str) -> Element {
+    Element::new(Page::Calendar, name).with_text(v)
+}
+
+#[tokio::test]
+async fn calendar_sync_and_meeting_response() {
+    let (fake, url) = start_fake().await;
+    fake.lock().unwrap().events.push(json!({
+        "id": "ev1", "@type": "Event", "uid": "meet-1@example.org",
+        "calendarIds": {"cal-work": true},
+        "title": "Planning", "start": "2026-10-20T14:00:00", "timeZone": "Europe/Berlin", "duration": "PT1H",
+        "organizerCalendarAddress": "mailto:bob@example.org",
+        "participants": {
+            "o": {"calendarAddress": "mailto:bob@example.org", "name": "Bob", "roles": {"owner": true}},
+            "me": {"calendarAddress": "mailto:alice@example.org", "roles": {"attendee": true}, "participationStatus": "needs-action", "expectReply": true}
+        }
+    }));
+    let (gw, _) = synced_gateway(&fake, &url).await;
+    let resp = gw.ok("FolderSync", &folder_sync("0")).await;
+    let calendar = resp
+        .child(Page::FolderHierarchy, "Changes")
+        .unwrap()
+        .children_named(Page::FolderHierarchy, "Add")
+        .find(|a| a.child_text(Page::FolderHierarchy, "Type").as_deref() == Some("8"))
+        .expect("default calendar folder")
+        .clone();
+    let cid = calendar
+        .child_text(Page::FolderHierarchy, "ServerId")
+        .unwrap();
+
+    let k = key_of(collection(
+        &gw.ok("Sync", &sync("0", &cid, None, vec![])).await,
+    ));
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![])).await;
+    let coll = collection(&resp).clone();
+    let k = key_of(&coll);
+    let add = commands(&coll, "Add")[0].clone();
+    let sid = add.child_text(Page::AirSync, "ServerId").unwrap();
+    let data = add.child(Page::AirSync, "ApplicationData").unwrap();
+    assert_eq!(
+        data.child_text(Page::Calendar, "Subject").as_deref(),
+        Some("Planning")
+    );
+    assert_eq!(
+        data.child_text(Page::Calendar, "StartTime").as_deref(),
+        Some("20261020T120000Z")
+    );
+    assert_eq!(
+        data.child_text(Page::Calendar, "MeetingStatus").as_deref(),
+        Some("3")
+    );
+    assert_eq!(
+        data.child_text(Page::Calendar, "ResponseType").as_deref(),
+        Some("5")
+    );
+
+    // Accept from the calendar.
+    let mr = Element::new(Page::MeetingResponse, "MeetingResponse").with_child(
+        Element::new(Page::MeetingResponse, "Request")
+            .with_child(t(Page::MeetingResponse, "UserResponse", "1"))
+            .with_child(t(Page::MeetingResponse, "CollectionId", &cid))
+            .with_child(t(Page::MeetingResponse, "RequestId", &sid)),
+    );
+    let resp = gw.ok("MeetingResponse", &mr).await;
+    let r = resp.child(Page::MeetingResponse, "Result").unwrap();
+    assert_eq!(
+        r.child_text(Page::MeetingResponse, "Status").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        r.child_text(Page::MeetingResponse, "CalendarId"),
+        Some(sid.clone())
+    );
+    {
+        let f = fake.lock().unwrap();
+        assert_eq!(
+            f.events[0]["participants"]["me"]["participationStatus"],
+            json!("accepted")
+        );
+        assert_eq!(f.scheduling.last(), Some(&true));
+    }
+    // The device hears about its new status.
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![])).await;
+    let coll = collection(&resp).clone();
+    let ch = commands(&coll, "Change");
+    assert_eq!(ch.len(), 1);
+    assert_eq!(
+        ch[0]
+            .child(Page::AirSync, "ApplicationData")
+            .unwrap()
+            .child_text(Page::Calendar, "ResponseType")
+            .as_deref(),
+        Some("3")
+    );
+    let k = key_of(&coll);
+
+    // The device adds an all-day event, then moves it a day later.
+    let blob = eas_convert::tz::from_iana("Europe/Berlin".parse().unwrap(), 2026).encode();
+    let new = Element::new(Page::AirSync, "Add")
+        .with_child(t(Page::AirSync, "ClientId", "ev-new"))
+        .with_child(
+            Element::new(Page::AirSync, "ApplicationData")
+                .with_child(cal("TimeZone", &blob))
+                .with_child(cal("AllDayEvent", "1"))
+                .with_child(cal("StartTime", "20261223T230000Z"))
+                .with_child(cal("EndTime", "20261224T230000Z"))
+                .with_child(cal("Subject", "Christmas Eve"))
+                .with_child(cal("BusyStatus", "0")),
+        );
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![new])).await;
+    let coll = collection(&resp).clone();
+    let added = coll
+        .child(Page::AirSync, "Responses")
+        .unwrap()
+        .child(Page::AirSync, "Add")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        added.child_text(Page::AirSync, "Status").as_deref(),
+        Some("1")
+    );
+    let new_sid = added.child_text(Page::AirSync, "ServerId").unwrap();
+    assert!(
+        coll.child(Page::AirSync, "Commands").is_none(),
+        "no echo: {}",
+        coll.to_xml()
+    );
+    let k = key_of(&coll);
+    {
+        let f = fake.lock().unwrap();
+        let ev = f
+            .events
+            .iter()
+            .find(|e| e["title"] == "Christmas Eve")
+            .unwrap();
+        assert_eq!(ev["start"], json!("2026-12-24T00:00:00"));
+        assert_eq!(ev["showWithoutTime"], json!(true));
+        assert_eq!(ev["freeBusyStatus"], json!("free"));
+        assert_eq!(ev["calendarIds"], json!({"cal-work": true}));
+    }
+    let change = Element::new(Page::AirSync, "Change")
+        .with_child(t(Page::AirSync, "ServerId", &new_sid))
+        .with_child(
+            Element::new(Page::AirSync, "ApplicationData")
+                .with_child(cal("TimeZone", &blob))
+                .with_child(cal("AllDayEvent", "1"))
+                .with_child(cal("StartTime", "20261224T230000Z"))
+                .with_child(cal("EndTime", "20261225T230000Z"))
+                .with_child(cal("Subject", "Christmas Day"))
+                .with_child(cal("BusyStatus", "0")),
+        );
+    let resp = gw.ok("Sync", &sync(&k, &cid, None, vec![change])).await;
+    let k = key_of(collection(&resp));
+    {
+        let f = fake.lock().unwrap();
+        let ev = f
+            .events
+            .iter()
+            .find(|e| e["title"] == "Christmas Day")
+            .unwrap();
+        assert_eq!(ev["start"], json!("2026-12-25T00:00:00"));
+    }
+
+    // Device delete removes it.
+    let del =
+        Element::new(Page::AirSync, "Delete").with_child(t(Page::AirSync, "ServerId", &new_sid));
+    gw.ok("Sync", &sync(&k, &cid, None, vec![del])).await;
+    assert!(!fake
+        .lock()
+        .unwrap()
+        .events
+        .iter()
+        .any(|e| e["title"] == "Christmas Day"));
 }

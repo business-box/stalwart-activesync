@@ -13,7 +13,7 @@
 //! The items table always matches what the device was last told, so
 //! anything left over from a full window is found again next time.
 
-use super::classes::Class;
+use super::classes::{self, Class, Viewer};
 use super::folder_sync::{folder_type, KIND_MAILBOX};
 use super::{empty, sync_key, wbxml, Ctx, HandlerError, HandlerResult};
 use eas_convert::email::{
@@ -243,7 +243,7 @@ pub async fn server_diff(
         None => (None, ctx.jmap.state(kind, &account).await?),
     };
     let after = match class {
-        Class::Mail => filter_after(filter),
+        Class::Mail | Class::Calendar => filter_after(filter),
         Class::Contacts => None,
     };
     let current = class.list(ctx, folder, after.as_deref()).await?;
@@ -313,27 +313,38 @@ pub(super) async fn serialise(
 async fn serialise_class(
     ctx: &Ctx<'_>,
     class: Class,
+    viewer: &Viewer,
     ids: &[String],
     opts: &BodyOptions,
 ) -> Result<Vec<(String, Value, Element)>, HandlerError> {
-    match class {
-        Class::Mail => serialise(ctx, ids, opts).await,
-        Class::Contacts => {
-            let cards = class.get(ctx, ids, &json!({})).await?;
-            let mut by_id: HashMap<String, Value> = cards
-                .into_iter()
-                .filter_map(|c| Some((c.get("id")?.as_str()?.to_string(), c)))
-                .collect();
-            Ok(ids
-                .iter()
-                .filter_map(|id| {
-                    let c = by_id.remove(id)?;
-                    let data = eas_convert::contact::application_data(&c);
-                    Some((id.clone(), c, data))
-                })
-                .collect())
-        }
+    if class == Class::Mail {
+        return serialise(ctx, ids, opts).await;
     }
+    let objects = class.get(ctx, ids, &json!({})).await?;
+    let mut by_id: HashMap<String, Value> = objects
+        .into_iter()
+        .filter_map(|c| Some((c.get("id")?.as_str()?.to_string(), c)))
+        .collect();
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(obj) = by_id.remove(id) else {
+            continue;
+        };
+        let data = match class {
+            Class::Calendar => {
+                match eas_convert::calendar::application_data(&obj, &viewer.me, viewer.v16) {
+                    Some(d) => d,
+                    None => {
+                        tracing::warn!(event = %id, "event without a usable start, not sent");
+                        continue;
+                    }
+                }
+            }
+            _ => eas_convert::contact::application_data(&obj),
+        };
+        out.push((id.clone(), obj, data));
+    }
+    Ok(out)
 }
 
 /// What is stored as a folder's options: the device's `Options` with its
@@ -554,6 +565,11 @@ async fn sync_collection(
     ));
     let (filter, body_opts) = parse_options(options.as_ref());
     let supported_fields = supported.as_ref().map(supported_names);
+    let viewer = if class == Class::Calendar {
+        classes::viewer(ctx).await?
+    } else {
+        Viewer::default()
+    };
     let window = coll
         .window_size
         .or(global_window)
@@ -577,9 +593,11 @@ async fn sync_collection(
     let mut touched: HashSet<String> = HashSet::new();
     let had_commands = first && !coll.commands.is_empty();
 
-    if first && class == Class::Contacts {
-        apply_contact_commands(
+    if first && class != Class::Mail {
+        apply_object_commands(
             ctx,
+            class,
+            &viewer,
             coll,
             &folder,
             supported_fields.as_ref(),
@@ -634,7 +652,7 @@ async fn sync_collection(
             commands.push(
                 Element::new(Page::AirSync, "Change")
                     .with_text_child("ServerId", sid.clone())
-                    .with_child(class.change_data(e)),
+                    .with_child(class.change_data(e, &viewer)),
             );
             let jmap_id = e.get("id").and_then(Value::as_str).unwrap_or_default();
             upsert.push(Item {
@@ -648,7 +666,7 @@ async fn sync_collection(
             jmap_state = Some(diff.new_state.clone());
         }
         let add_ids: Vec<String> = diff.adds.iter().take(room).cloned().collect();
-        for (id, e, data) in serialise_class(ctx, class, &add_ids, &body_opts).await? {
+        for (id, e, data) in serialise_class(ctx, class, &viewer, &add_ids, &body_opts).await? {
             let sid = server_id(cid, &id);
             commands.push(
                 Element::new(Page::AirSync, "Add")
@@ -893,10 +911,13 @@ async fn apply_client_commands(
     Ok(())
 }
 
-/// Applies `Add`, `Change`, `Delete` and `Fetch` from the device to cards.
+/// Applies `Add`, `Change`, `Delete` and `Fetch` from the device to cards
+/// or events.
 #[allow(clippy::too_many_arguments)]
-async fn apply_contact_commands(
+async fn apply_object_commands(
     ctx: &Ctx<'_>,
+    class: Class,
+    viewer: &Viewer,
     coll: &CollectionRequest,
     folder: &Folder,
     supported: Option<&HashSet<String>>,
@@ -907,10 +928,17 @@ async fn apply_contact_commands(
     delete: &mut Vec<String>,
     touched: &mut HashSet<String>,
 ) -> Result<(), HandlerError> {
+    use eas_convert::calendar::{year_hint, EasEvent};
     use eas_convert::contact;
     use eas_jmap::{SetOp, SetOutcome};
-    let class = Class::Contacts;
     let account = class.account(ctx)?;
+    let method = format!("{}/set", class.jmap_type());
+    // Invitations and updates go out from the server for 16.x clients;
+    // older ones send their own meeting mail.
+    let set_args = match class {
+        Class::Calendar => json!({ "sendSchedulingMessages": viewer.v16 }),
+        _ => Value::Null,
+    };
     let store = &ctx.state.store;
     let dev = ctx.device.id;
     let response = |name: &str, id_tag: &str, id: &str, code: u8| {
@@ -950,15 +978,23 @@ async fn apply_contact_commands(
                     ));
                     continue;
                 };
-                let card = contact::new_card(data, &folder.jmap_id);
+                let object = match class {
+                    Class::Calendar => EasEvent::from_device(data, None, year_hint())
+                        .map(|e| e.to_new_jmap(&folder.jmap_id, &viewer.me)),
+                    _ => Some(contact::new_card(data, &folder.jmap_id)),
+                };
+                let Some(object) = object else {
+                    responses.push(response(
+                        "Add",
+                        "ClientId",
+                        &client_id,
+                        status::CONVERSION_ERROR,
+                    ));
+                    continue;
+                };
                 match ctx
                     .jmap
-                    .set_one(
-                        "ContactCard/set",
-                        &account,
-                        SetOp::Create(card),
-                        Value::Null,
-                    )
+                    .set_one(&method, &account, SetOp::Create(object), set_args.clone())
                     .await?
                 {
                     SetOutcome::Created(id) => {
@@ -972,7 +1008,7 @@ async fn apply_contact_commands(
                         written.push((sid, id));
                     }
                     other => {
-                        tracing::info!(device = %ctx.line.device_id, ?other, "contact add failed");
+                        tracing::info!(device = %ctx.line.device_id, ?other, "device add failed");
                         responses.push(response(
                             "Add",
                             "ClientId",
@@ -994,7 +1030,15 @@ async fn apply_contact_commands(
                     responses.push(response("Change", "ServerId", &sid, status::NOT_FOUND));
                     continue;
                 };
-                let patch = contact::device_patch(current, data, supported);
+                let patch = match class {
+                    Class::Calendar => EasEvent::from_jmap(current)
+                        .and_then(|cur| {
+                            let dev = EasEvent::from_device(data, Some(&cur), year_hint())?;
+                            Some(dev.patch(&cur, current, &viewer.me))
+                        })
+                        .unwrap_or_default(),
+                    _ => contact::device_patch(current, data, supported),
+                };
                 touched.insert(jmap_id.clone());
                 if patch.is_empty() {
                     continue;
@@ -1002,16 +1046,16 @@ async fn apply_contact_commands(
                 match ctx
                     .jmap
                     .set_one(
-                        "ContactCard/set",
+                        &method,
                         &account,
                         SetOp::Update(jmap_id.clone(), Value::Object(patch)),
-                        Value::Null,
+                        set_args.clone(),
                     )
                     .await?
                 {
                     SetOutcome::Updated => written.push((sid, jmap_id.clone())),
                     SetOutcome::Failed(kind) => {
-                        tracing::info!(device = %ctx.line.device_id, %kind, "contact change failed");
+                        tracing::info!(device = %ctx.line.device_id, %kind, "device change failed");
                         touched.remove(jmap_id);
                         let code = if kind == "notFound" {
                             status::NOT_FOUND
@@ -1030,15 +1074,15 @@ async fn apply_contact_commands(
                 let out = ctx
                     .jmap
                     .set_one(
-                        "ContactCard/set",
+                        &method,
                         &account,
                         SetOp::Destroy(jmap_id.clone()),
-                        Value::Null,
+                        set_args.clone(),
                     )
                     .await?;
                 if let SetOutcome::Failed(kind) = &out {
                     if kind != "notFound" {
-                        tracing::info!(device = %ctx.line.device_id, %kind, "contact delete failed");
+                        tracing::info!(device = %ctx.line.device_id, %kind, "device delete failed");
                     }
                 }
                 items.remove(jmap_id);
@@ -1052,6 +1096,7 @@ async fn apply_contact_commands(
                 let found = serialise_class(
                     ctx,
                     class,
+                    viewer,
                     std::slice::from_ref(jmap_id),
                     &BodyOptions::default(),
                 )

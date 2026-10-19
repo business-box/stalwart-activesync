@@ -4,7 +4,7 @@ Exchange ActiveSync (EAS) gateway for [Stalwart](https://github.com/stalwartlabs
 
 It lets the built-in mail, calendar and contacts apps on iOS and Android (Gmail, Samsung Email) sync with a Stalwart account without installing anything. The gateway speaks EAS 14.1 and 16.1 to phones and only JMAP to Stalwart, so Stalwart runs unmodified. Desktop clients are out of scope: use Thunderbird (IMAP, CalDAV, CardDAV) directly against Stalwart.
 
-**Status: early development.** Mail is complete end to end against the in-process JMAP test double: provisioning, folders, sync, push, sending, replies and forwards, attachments, moves, search and out-of-office. None of it has been tried with real phones or a real Stalwart yet. Contacts and folder management work too; calendars are next; commands that aren't implemented answer `501 Not Implemented`. See [docs/PLAN.md](docs/PLAN.md) for scope, architecture, the work breakdown and the roadmap.
+**Status: early development.** Mail is complete end to end against the in-process JMAP test double: provisioning, folders, sync, push, sending, replies and forwards, attachments, moves, search and out-of-office. None of it has been tried with real phones or a real Stalwart yet. Contacts, calendars and folder management work too; commands that aren't implemented answer `501 Not Implemented`. See [docs/PLAN.md](docs/PLAN.md) for scope, architecture, the work breakdown and the roadmap.
 
 ## What works today
 
@@ -20,7 +20,9 @@ It lets the built-in mail, calendar and contacts apps on iOS and Android (Gmail,
 | `Sync` (mail) | SyncKey state machine with retry replay, window size and `MoreAvailable`, filter types, plain/HTML/MIME bodies with truncation and preview, attachments listed; device read/flag changes, deletes (to Trash) and fetches; server-side adds, deletes and read/flag changes; empty (cached) requests; `Wait`/`HeartbeatInterval` held by polling until push lands |
 | `GetItemEstimate` | Mail folders |
 | State (`eas-state`) | SQLite: devices, policy keys, folder map, per-folder sync state with replay data, items |
-| Not yet | `MeetingResponse`, `ResolveRecipients`, `Find`, GAL, drafts sync (16.x), calendars, contact photos, creating contact folders from the device |
+| Calendar | Calendars as folders (the default one as the device's Calendar); events synced both ways with time zones, all-day events, reminders, busy status, privacy, categories, attendees, recurrence (daily, weekly, monthly, nth weekday, yearly) and exceptions; calendar FilterType as a date window; device edits patch only what changed; 16.x devices get server-sent invitations |
+| `MeetingResponse` | Accept, tentative or decline from the calendar item or the invitation mail (found by UID); Stalwart sends the reply |
+| Not yet | `ResolveRecipients`, `Find`, GAL, drafts sync (16.x), meeting-request details in invitation mails, responses to single occurrences, contact photos, creating contact or calendar folders from the device, tasks |
 
 ## Layout
 
@@ -29,7 +31,7 @@ It lets the built-in mail, calendar and contacts apps on iOS and Android (Gmail,
 | `crates/eas-wbxml` | WBXML tokens, code pages, encoder and decoder |
 | `crates/eas-proto` | Versions, commands, request lines, OPTIONS, autodiscover, status codes, the policy document |
 | `crates/eas-jmap` | JMAP session, batched calls, method errors, blobs, per-user concurrency limit, EventSource, mail, submission and vacation helpers |
-| `crates/eas-convert` | Email items, read/flag patches, outgoing MIME (envelope, Bcc, smart reply/forward), JSContact cards; JSCalendar next |
+| `crates/eas-convert` | Email items, read/flag patches, outgoing MIME (envelope, Bcc, smart reply/forward), JSContact cards, JSCalendar events, Windows time zone blobs |
 | `crates/eas-state` | Device and sync state in SQLite |
 | `crates/eas-server` | The `stalwart-activesync` binary: HTTP, auth, policy checks, command handlers |
 

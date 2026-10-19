@@ -280,7 +280,10 @@ The deciding facts come from Stalwart's own repo and support portal: no EAS plan
 - [x] `ItemOperations`, `SendMail`/`SmartReply`/`SmartForward`, `MoveItems`, `Search`, `Settings`.
 - [x] Container image built in GitHub Actions and pushed to GHCR.
 - [ ] Try the mail stage against a staging Stalwart and the device lab (M1 gate).
-- [ ] Folder create/update/delete; then phase 3 (calendar).
+- [x] Folder create/update/delete for mail; admin API and metrics.
+- [x] Phase 4 core: contacts (address books, cards both ways, ghosting-safe patches).
+- [x] Phase 3 core: calendar (events both ways, time zones, recurrence, exceptions, attendees, MeetingResponse).
+- [ ] Meeting details in invitation mails, single-occurrence responses, GAL and ResolveRecipients.
 
 ## Sources
 
