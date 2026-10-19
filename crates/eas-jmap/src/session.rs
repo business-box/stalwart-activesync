@@ -44,6 +44,22 @@ pub enum JmapError {
     Transport(#[from] reqwest::Error),
     #[error("invalid Stalwart URL: {0}")]
     Url(#[from] url::ParseError),
+    #[error("{method} failed: {kind}")]
+    Method {
+        method: String,
+        kind: String,
+        description: Option<String>,
+    },
+    #[error("unexpected JMAP response: {0}")]
+    Protocol(String),
+}
+
+impl JmapError {
+    /// True for a method error of the given JMAP type, such as
+    /// `cannotCalculateChanges`.
+    pub fn is_method(&self, t: &str) -> bool {
+        matches!(self, JmapError::Method { kind, .. } if kind == t)
+    }
 }
 
 /// Where and how to reach Stalwart's JMAP API.
