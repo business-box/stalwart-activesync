@@ -228,6 +228,76 @@ fn parse_responses(calls: &[Call], value: Value) -> Result<Vec<Value>, JmapError
     Ok(out)
 }
 
+/// Outcome of a `/set` call on a single object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetOutcome {
+    /// Created, with the new object's ID.
+    Created(String),
+    Updated,
+    Destroyed,
+    /// Refused, with the JMAP SetError type (`notFound`, `forbidden`, ...).
+    Failed(String),
+}
+
+/// What a single-object `/set` should do.
+#[derive(Debug, Clone)]
+pub enum SetOp {
+    Create(Value),
+    Update(String, Value),
+    Destroy(String),
+}
+
+impl JmapClient {
+    /// One create, update or destroy through `method` (such as
+    /// `Mailbox/set`), with `extra` arguments merged into the call.
+    pub async fn set_one(
+        &self,
+        method: &str,
+        account: &str,
+        op: SetOp,
+        extra: Value,
+    ) -> Result<SetOutcome, JmapError> {
+        let mut args = extra.as_object().cloned().unwrap_or_default();
+        args.insert("accountId".into(), json!(account));
+        let (key, not_key, id) = match &op {
+            SetOp::Create(obj) => {
+                args.insert("create".into(), json!({ "n": obj }));
+                ("created", "notCreated", "n".to_string())
+            }
+            SetOp::Update(id, patch) => {
+                args.insert("update".into(), json!({ id.as_str(): patch }));
+                ("updated", "notUpdated", id.clone())
+            }
+            SetOp::Destroy(id) => {
+                args.insert("destroy".into(), json!([id]));
+                ("destroyed", "notDestroyed", id.clone())
+            }
+        };
+        let res = self.call(method, Value::Object(args)).await?;
+        if let Some(err) = res.get(not_key).and_then(|m| m.get(&id)) {
+            let kind = err
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("serverFail")
+                .to_string();
+            return Ok(SetOutcome::Failed(kind));
+        }
+        Ok(match op {
+            SetOp::Create(_) => match res
+                .get(key)
+                .and_then(|m| m.get("n"))
+                .and_then(|c| c.get("id"))
+                .and_then(Value::as_str)
+            {
+                Some(new_id) => SetOutcome::Created(new_id.to_string()),
+                None => return Err(JmapError::Protocol(format!("{method}: no created id"))),
+            },
+            SetOp::Update(..) => SetOutcome::Updated,
+            SetOp::Destroy(_) => SetOutcome::Destroyed,
+        })
+    }
+}
+
 /// Fills an RFC 6570 level-1 URI template as used by the JMAP session's
 /// download and upload URLs.
 pub(crate) fn expand_template(template: &str, vars: &[(&str, &str)]) -> String {

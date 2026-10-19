@@ -3,6 +3,7 @@
 
 mod compose;
 mod estimate;
+mod folder_ops;
 mod folder_sync;
 mod item_operations;
 mod move_items;
@@ -92,6 +93,9 @@ pub async fn dispatch(ctx: Ctx<'_>, command: Command, request: Option<Element>) 
         Command::GetAttachment => item_operations::get_attachment(&ctx).await,
         Command::MoveItems => move_items::handle(&ctx, request).await,
         Command::Settings => settings::handle(&ctx, request).await,
+        Command::FolderCreate | Command::FolderUpdate | Command::FolderDelete => {
+            folder_ops::handle(&ctx, command, request).await
+        }
         Command::Search => search::handle(&ctx, request).await,
         Command::SendMail | Command::SmartReply | Command::SmartForward => {
             compose::handle(&ctx, command, request).await

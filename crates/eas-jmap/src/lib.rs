@@ -14,5 +14,5 @@ pub mod mail;
 pub mod push;
 mod session;
 
-pub use client::{Call, JmapClient, UserLimits};
+pub use client::{Call, JmapClient, SetOp, SetOutcome, UserLimits};
 pub use session::{capability, Credentials, JmapError, Session, StalwartEndpoint};

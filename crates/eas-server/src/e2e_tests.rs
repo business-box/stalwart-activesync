@@ -24,6 +24,7 @@ struct Fake {
     log: Vec<(u64, String)>,
     blobs: HashMap<String, Vec<u8>>,
     vacation: Value,
+    mailboxes: Vec<Value>,
     /// (identity ID, envelope, stored MIME, kept in a mailbox)
     submissions: Vec<(String, Value, Vec<u8>, bool)>,
 }
@@ -99,12 +100,45 @@ fn matches(e: &Value, f: &Value) -> bool {
 fn method(fake: &mut Fake, name: &str, args: &Value) -> (String, Value) {
     let ok = |v: Value| (name.to_string(), v);
     match name {
-        "Mailbox/get" => ok(json!({"state": "m1", "list": [
-            {"id": "inbox", "name": "Inbox", "role": "inbox", "parentId": null},
-            {"id": "trash", "name": "Trash", "role": "trash", "parentId": null},
-            {"id": "sent", "name": "Sent", "role": "sent", "parentId": null},
-            {"id": "sub", "name": "Projects", "role": null, "parentId": "inbox"}
-        ]})),
+        "Mailbox/get" => ok(json!({"state": "m1", "list": fake.mailboxes})),
+        "Mailbox/set" => {
+            let mut out = json!({});
+            if let Some(c) = args["create"].as_object() {
+                for (k, v) in c {
+                    let id = format!("mb{}", fake.mailboxes.len());
+                    let mut mb = v.clone();
+                    mb["id"] = json!(id);
+                    mb["role"] = Value::Null;
+                    fake.mailboxes.push(mb);
+                    out["created"][k] = json!({"id": id});
+                }
+            }
+            if let Some(u) = args["update"].as_object() {
+                for (id, patch) in u {
+                    match fake.mailboxes.iter_mut().find(|m| m["id"] == id.as_str()) {
+                        Some(m) => {
+                            for (k, v) in patch.as_object().unwrap() {
+                                m[k] = v.clone();
+                            }
+                            out["updated"][id] = Value::Null;
+                        }
+                        None => out["notUpdated"][id] = json!({"type": "notFound"}),
+                    }
+                }
+            }
+            if let Some(d) = args["destroy"].as_array() {
+                for id in d {
+                    let id = id.as_str().unwrap().to_string();
+                    if fake.mailboxes.iter().any(|m| m["parentId"] == id.as_str()) {
+                        out["notDestroyed"][&id] = json!({"type": "mailboxHasChild"});
+                        continue;
+                    }
+                    fake.mailboxes.retain(|m| m["id"] != id.as_str());
+                    out["destroyed"] = json!([id]);
+                }
+            }
+            ok(out)
+        }
         "Email/get" => {
             let ids: Vec<&str> = args["ids"]
                 .as_array()
@@ -270,6 +304,13 @@ async fn event_source(State(st): State<(Shared, SocketAddr)>) -> axum::response:
 
 async fn start_fake() -> (Shared, String) {
     let shared: Shared = Arc::default();
+    shared.lock().unwrap().mailboxes = serde_json::from_value(json!([
+        {"id": "inbox", "name": "Inbox", "role": "inbox", "parentId": null},
+        {"id": "trash", "name": "Trash", "role": "trash", "parentId": null},
+        {"id": "sent", "name": "Sent", "role": "sent", "parentId": null},
+        {"id": "sub", "name": "Projects", "role": null, "parentId": "inbox"}
+    ]))
+    .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router = Router::new()
@@ -1214,4 +1255,160 @@ async fn settings_and_search() {
     );
     let resp = gw.ok("ItemOperations", &fetch).await;
     assert!(resp.to_xml().contains("Invoice October"));
+}
+
+fn folder_cmd(cmd: &str, fields: &[(&str, &str)]) -> Element {
+    let mut el = Element::new(Page::FolderHierarchy, cmd);
+    for (k, v) in fields {
+        el.push(t(Page::FolderHierarchy, k, v));
+    }
+    el
+}
+
+#[tokio::test]
+async fn folder_create_update_delete() {
+    let (fake, url) = start_fake().await;
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+    let resp = gw.ok("FolderSync", &folder_sync("0")).await;
+    let k0 = resp.child_text(Page::FolderHierarchy, "SyncKey").unwrap();
+    let status = |r: &Element| r.child_text(Page::FolderHierarchy, "Status").unwrap();
+
+    // Wrong key: 9.
+    let r = gw
+        .ok(
+            "FolderCreate",
+            &folder_cmd(
+                "FolderCreate",
+                &[
+                    ("SyncKey", "x"),
+                    ("ParentId", "0"),
+                    ("DisplayName", "A"),
+                    ("Type", "12"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(status(&r), "9");
+
+    // Create under the inbox.
+    let r = gw
+        .ok(
+            "FolderCreate",
+            &folder_cmd(
+                "FolderCreate",
+                &[
+                    ("SyncKey", &k0),
+                    ("ParentId", &inbox),
+                    ("DisplayName", "Receipts"),
+                    ("Type", "12"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(status(&r), "1");
+    let k1 = r.child_text(Page::FolderHierarchy, "SyncKey").unwrap();
+    let id = r.child_text(Page::FolderHierarchy, "ServerId").unwrap();
+    assert!(fake
+        .lock()
+        .unwrap()
+        .mailboxes
+        .iter()
+        .any(|m| m["name"] == "Receipts" && m["parentId"] == "inbox"));
+    // Same name again: 2.
+    let r = gw
+        .ok(
+            "FolderCreate",
+            &folder_cmd(
+                "FolderCreate",
+                &[
+                    ("SyncKey", &k1),
+                    ("ParentId", &inbox),
+                    ("DisplayName", "receipts"),
+                    ("Type", "12"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(status(&r), "2");
+
+    // The next FolderSync has nothing new to report.
+    let r = gw.ok("FolderSync", &folder_sync(&k1)).await;
+    assert_eq!(
+        r.child(Page::FolderHierarchy, "Changes")
+            .unwrap()
+            .child_text(Page::FolderHierarchy, "Count")
+            .as_deref(),
+        Some("0")
+    );
+
+    // Rename and move to the top.
+    let r = gw
+        .ok(
+            "FolderUpdate",
+            &folder_cmd(
+                "FolderUpdate",
+                &[
+                    ("SyncKey", &k1),
+                    ("ServerId", &id),
+                    ("ParentId", "0"),
+                    ("DisplayName", "Bills"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(status(&r), "1");
+    let k2 = r.child_text(Page::FolderHierarchy, "SyncKey").unwrap();
+    assert!(fake
+        .lock()
+        .unwrap()
+        .mailboxes
+        .iter()
+        .any(|m| m["name"] == "Bills" && m["parentId"].is_null()));
+    // The inbox can't be renamed: 3.
+    let r = gw
+        .ok(
+            "FolderUpdate",
+            &folder_cmd(
+                "FolderUpdate",
+                &[
+                    ("SyncKey", &k2),
+                    ("ServerId", &inbox),
+                    ("ParentId", "0"),
+                    ("DisplayName", "X"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(status(&r), "3");
+
+    // Delete; then the FolderSync stays quiet and a second delete is 4.
+    let r = gw
+        .ok(
+            "FolderDelete",
+            &folder_cmd("FolderDelete", &[("SyncKey", &k2), ("ServerId", &id)]),
+        )
+        .await;
+    assert_eq!(status(&r), "1");
+    let k3 = r.child_text(Page::FolderHierarchy, "SyncKey").unwrap();
+    assert!(!fake
+        .lock()
+        .unwrap()
+        .mailboxes
+        .iter()
+        .any(|m| m["name"] == "Bills"));
+    let r = gw.ok("FolderSync", &folder_sync(&k3)).await;
+    assert_eq!(
+        r.child(Page::FolderHierarchy, "Changes")
+            .unwrap()
+            .child_text(Page::FolderHierarchy, "Count")
+            .as_deref(),
+        Some("0")
+    );
+    let r = gw
+        .ok(
+            "FolderDelete",
+            &folder_cmd("FolderDelete", &[("SyncKey", &k3), ("ServerId", &id)]),
+        )
+        .await;
+    assert_eq!(status(&r), "4");
 }
