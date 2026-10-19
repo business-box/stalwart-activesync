@@ -1,0 +1,30 @@
+[package]
+name = "eas-server"
+description = "Exchange ActiveSync gateway for Stalwart: HTTP front, auth, command dispatch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "stalwart-activesync"
+path = "src/main.rs"
+
+[dependencies]
+eas-wbxml.workspace = true
+eas-proto.workspace = true
+eas-jmap.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+base64.workspace = true
+sha2 = "0.10"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[lints]
+workspace = true

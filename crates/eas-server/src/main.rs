@@ -1,0 +1,193 @@
+//! `stalwart-activesync`: Exchange ActiveSync gateway for Stalwart.
+//!
+//! Configuration comes from the environment; see `config.rs` and the README.
+
+mod app;
+mod auth;
+mod config;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,stalwart_activesync=info".into()),
+        )
+        .init();
+
+    let config = match config::Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("configuration error: {e}");
+            std::process::exit(2);
+        }
+    };
+    let endpoint = match eas_jmap::StalwartEndpoint::new(&config.stalwart_url) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("configuration error: STALWART_URL: {e}");
+            std::process::exit(2);
+        }
+    };
+    let auth = auth::Authenticator::new(endpoint, Duration::from_secs(config.auth_cache_secs));
+    let listen = config.listen;
+    let state = Arc::new(app::AppState { config, auth });
+
+    let listener = match tokio::net::TcpListener::bind(listen).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("cannot listen on {listen}: {e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(%listen, "stalwart-activesync listening");
+    let app = app::router(state).into_make_service_with_connect_info::<SocketAddr>();
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+    {
+        eprintln!("server error: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn test_app() -> axum::Router {
+        let config = config::Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            // Nothing listens here; tests below never reach Stalwart.
+            stalwart_url: "http://127.0.0.1:9/".into(),
+            public_url: "https://mail.example.org".into(),
+            trust_forwarded: true,
+            max_body_bytes: 1024 * 1024,
+            auth_cache_secs: 300,
+        };
+        let endpoint = eas_jmap::StalwartEndpoint::new(&config.stalwart_url).unwrap();
+        let auth = auth::Authenticator::new(endpoint, Duration::from_secs(300));
+        app::router(Arc::new(app::AppState { config, auth })).layer(
+            axum::extract::connect_info::MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))),
+        )
+    }
+
+    #[tokio::test]
+    async fn options_lists_versions() {
+        let resp = test_app()
+            .oneshot(
+                Request::options("/Microsoft-Server-ActiveSync?User=a&DeviceId=x&DeviceType=y")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()["ms-asprotocolversions"],
+            "14.0,14.1,16.0,16.1"
+        );
+        assert!(resp.headers()["ms-asprotocolcommands"]
+            .to_str()
+            .unwrap()
+            .contains("FolderSync"));
+    }
+
+    #[tokio::test]
+    async fn post_without_credentials_is_401() {
+        let resp = test_app()
+            .oneshot(
+                Request::post(
+                    "/Microsoft-Server-ActiveSync?Cmd=FolderSync&User=a&DeviceId=x&DeviceType=y",
+                )
+                .header("MS-ASProtocolVersion", "16.1")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().contains_key("www-authenticate"));
+    }
+
+    #[tokio::test]
+    async fn bad_request_lines_are_400() {
+        for uri in [
+            "/Microsoft-Server-ActiveSync?Cmd=Bogus&DeviceId=x&DeviceType=y",
+            "/Microsoft-Server-ActiveSync?User=a&DeviceId=x&DeviceType=y",
+            "/Microsoft-Server-ActiveSync?Cmd=Sync&DeviceId=x%27&DeviceType=y",
+        ] {
+            let resp = test_app()
+                .oneshot(Request::post(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        let resp = test_app()
+            .oneshot(
+                Request::post(
+                    "/Microsoft-Server-ActiveSync?Cmd=Sync&User=a&DeviceId=x&DeviceType=y",
+                )
+                .header("MS-ASProtocolVersion", "12.1")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unreachable_stalwart_is_503_with_retry_after() {
+        let resp = test_app()
+            .oneshot(
+                Request::post(
+                    "/Microsoft-Server-ActiveSync?Cmd=FolderSync&User=a&DeviceId=x&DeviceType=y",
+                )
+                .header("MS-ASProtocolVersion", "16.1")
+                .header("Authorization", "Basic YTpi")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key("retry-after"));
+    }
+
+    #[tokio::test]
+    async fn autodiscover_requires_auth_and_rejects_garbage() {
+        let body = r#"<Autodiscover><Request><EMailAddress>a@example.org</EMailAddress><AcceptableResponseSchema>http://schemas.microsoft.com/exchange/autodiscover/mobilesync/responseschema/2006</AcceptableResponseSchema></Request></Autodiscover>"#;
+        let resp = test_app()
+            .oneshot(
+                Request::post("/autodiscover/autodiscover.xml")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = test_app()
+            .oneshot(
+                Request::post("/Autodiscover/Autodiscover.xml")
+                    .body(Body::from("nope"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&text[..], b"invalid autodiscover request");
+    }
+}

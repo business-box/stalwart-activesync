@@ -1,0 +1,17 @@
+[package]
+name = "eas-proto"
+description = "Exchange ActiveSync protocol model: versions, commands, request lines, typed messages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eas-wbxml.workspace = true
+thiserror.workspace = true
+base64.workspace = true
+form_urlencoded.workspace = true
+
+[lints]
+workspace = true
