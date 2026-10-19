@@ -177,7 +177,7 @@ pub fn filter_after(filter: u8) -> Option<String> {
     Some(t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
-fn server_id(folder: &str, jmap_id: &str) -> String {
+pub(super) fn server_id(folder: &str, jmap_id: &str) -> String {
     format!("{folder}:{jmap_id}")
 }
 
@@ -278,7 +278,7 @@ pub async fn server_diff(
 
 /// Full `ApplicationData` for each email in `ids`, downloading the message
 /// when the device wants MIME. Emails that vanished meanwhile are skipped.
-async fn serialise(
+pub(super) async fn serialise(
     ctx: &Ctx<'_>,
     ids: &[String],
     opts: &BodyOptions,

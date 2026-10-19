@@ -477,6 +477,42 @@ impl Store {
             .collect())
     }
 
+    /// Records a move the device made itself (`MoveItems`): the item leaves
+    /// `src_folder` and, if given, is known under its new ID in the
+    /// destination, so neither folder's next Sync reports it again.
+    pub async fn move_item(
+        &self,
+        device: i64,
+        src_folder: &str,
+        src_id: &str,
+        dst_folder: &str,
+        dst: Option<Item>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM items WHERE device = ?1 AND folder = ?2 AND server_id = ?3")
+            .bind(device)
+            .bind(src_folder)
+            .bind(src_id)
+            .execute(&mut *tx)
+            .await?;
+        if let Some(it) = dst {
+            sqlx::query(
+                "INSERT INTO items (device, folder, server_id, jmap_id, hash) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (device, folder, server_id) DO UPDATE SET
+                   jmap_id = excluded.jmap_id, hash = excluded.hash",
+            )
+            .bind(device)
+            .bind(dst_folder)
+            .bind(&it.server_id)
+            .bind(&it.jmap_id)
+            .bind(&it.hash)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn commit_sync(&self, device: i64, commit: SyncCommit) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         if commit.reset {
@@ -662,6 +698,21 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(s.items(d.id, "2").await.unwrap().len(), 1);
+        s.move_item(
+            d.id,
+            "2",
+            "2:y",
+            "1",
+            Some(Item {
+                server_id: "1:y".into(),
+                jmap_id: "y".into(),
+                hash: "h".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(s.items(d.id, "2").await.unwrap().is_empty());
+        assert_eq!(s.items(d.id, "1").await.unwrap()[0].server_id, "1:y");
         assert_eq!(
             s.sync_state(d.id, "2").await.unwrap().unwrap().sync_key,
             "k2"

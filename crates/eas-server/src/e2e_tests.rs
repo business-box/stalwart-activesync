@@ -242,8 +242,20 @@ impl Gateway {
 
     /// Sends a command; `None` for an empty response body.
     async fn send(&self, cmd: &str, body: Option<&Element>) -> (StatusCode, Option<Element>) {
+        let (status, bytes) = self.send_raw(cmd, "", body).await;
+        let el = (!bytes.is_empty()).then(|| eas_wbxml::decode(&bytes).unwrap());
+        (status, el)
+    }
+
+    /// Sends a command with extra query parameters; returns the raw body.
+    async fn send_raw(
+        &self,
+        cmd: &str,
+        extra: &str,
+        body: Option<&Element>,
+    ) -> (StatusCode, Vec<u8>) {
         let mut req = Request::post(format!(
-            "/Microsoft-Server-ActiveSync?Cmd={cmd}&User=alice&DeviceId=DEV1&DeviceType=iPhone"
+            "/Microsoft-Server-ActiveSync?Cmd={cmd}&User=alice&DeviceId=DEV1&DeviceType=iPhone{extra}"
         ))
         .header("MS-ASProtocolVersion", "16.1")
         // alice:secret
@@ -261,8 +273,7 @@ impl Gateway {
             .unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let el = (!bytes.is_empty()).then(|| eas_wbxml::decode(&bytes).unwrap());
-        (status, el)
+        (status, bytes.to_vec())
     }
 
     async fn ok(&self, cmd: &str, body: &Element) -> Element {
@@ -615,7 +626,9 @@ fn ping(heartbeat: Option<&str>, folders: &[&str]) -> Element {
 
 /// Provisioned gateway with the inbox fully synced; returns the inbox ID.
 async fn synced_gateway(fake: &Shared, url: &str) -> (Gateway, String) {
-    fake.lock().unwrap().add("e1", "inbox", "2026-10-01T10:00:00Z");
+    fake.lock()
+        .unwrap()
+        .add("e1", "inbox", "2026-10-01T10:00:00Z");
     let mut gw = Gateway::new(url).await;
     let temp = policy_key(&gw.ok("Provision", &provision_request(None)).await);
     let key = policy_key(&gw.ok("Provision", &provision_request(Some(&temp))).await);
@@ -629,7 +642,9 @@ async fn synced_gateway(fake: &Shared, url: &str) -> (Gateway, String) {
         .unwrap()
         .child_text(Page::FolderHierarchy, "ServerId")
         .unwrap();
-    let k = key_of(collection(&gw.ok("Sync", &sync("0", &inbox, None, vec![])).await));
+    let k = key_of(collection(
+        &gw.ok("Sync", &sync("0", &inbox, None, vec![])).await,
+    ));
     let resp = gw.ok("Sync", &sync(&k, &inbox, None, vec![])).await;
     assert_eq!(commands(collection(&resp), "Add").len(), 1);
     (gw, inbox)
@@ -666,14 +681,19 @@ async fn ping_wakes_on_push_and_validates() {
     };
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!pinging.is_finished(), "Ping returned before any change");
-    fake.lock().unwrap().add("e2", "inbox", "2026-10-02T10:00:00Z");
+    fake.lock()
+        .unwrap()
+        .add("e2", "inbox", "2026-10-02T10:00:00Z");
     let resp = tokio::time::timeout(Duration::from_secs(10), pinging)
         .await
         .expect("Ping woken by push")
         .unwrap();
     assert_eq!(ping_status(&resp), "2");
     let folders = resp.child(Page::Ping, "Folders").unwrap();
-    assert_eq!(folders.child_text(Page::Ping, "Folder"), Some(inbox.clone()));
+    assert_eq!(
+        folders.child_text(Page::Ping, "Folder"),
+        Some(inbox.clone())
+    );
     assert!(started.elapsed() < Duration::from_secs(10));
 
     // Pending changes answer at once; an empty Ping reuses the last folders.
@@ -703,4 +723,127 @@ async fn new_ping_ends_the_waiting_one() {
         .unwrap();
     assert_eq!(ping_status(&resp), "1");
     second.abort();
+}
+
+#[tokio::test]
+async fn item_operations_and_move_items() {
+    let (fake, url) = start_fake().await;
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+    fake.lock().unwrap().email("e1")["attachments"] = json!([
+        {"blobId": "att1", "name": "a.txt", "type": "text/plain", "size": 25}
+    ]);
+    let raw = b"Subject: raw\r\n\r\nraw body";
+    let sid = format!("{inbox}:e1");
+
+    // Full item and attachment on demand.
+    let req = Element::new(Page::ItemOperations, "ItemOperations")
+        .with_child(
+            Element::new(Page::ItemOperations, "Fetch")
+                .with_child(t(Page::ItemOperations, "Store", "Mailbox"))
+                .with_child(t(Page::AirSync, "CollectionId", &inbox))
+                .with_child(t(Page::AirSync, "ServerId", &sid)),
+        )
+        .with_child(
+            Element::new(Page::ItemOperations, "Fetch")
+                .with_child(t(Page::ItemOperations, "Store", "Mailbox"))
+                .with_child(t(Page::AirSyncBase, "FileReference", "e1:att1")),
+        )
+        .with_child(
+            Element::new(Page::ItemOperations, "Fetch")
+                .with_child(t(Page::ItemOperations, "Store", "Mailbox"))
+                .with_child(t(Page::AirSync, "CollectionId", &inbox))
+                .with_child(t(Page::AirSync, "ServerId", &format!("{inbox}:nope"))),
+        );
+    let resp = gw.ok("ItemOperations", &req).await;
+    assert_eq!(
+        resp.child_text(Page::ItemOperations, "Status").as_deref(),
+        Some("1")
+    );
+    let fetches: Vec<_> = resp
+        .child(Page::ItemOperations, "Response")
+        .unwrap()
+        .children_named(Page::ItemOperations, "Fetch")
+        .collect();
+    assert_eq!(fetches.len(), 3);
+    let props = fetches[0]
+        .child(Page::ItemOperations, "Properties")
+        .unwrap();
+    assert_eq!(
+        props.child_text(Page::Email, "Subject").as_deref(),
+        Some("Subject e1")
+    );
+    let data = fetches[1]
+        .child(Page::ItemOperations, "Properties")
+        .unwrap()
+        .child_text(Page::ItemOperations, "Data")
+        .unwrap();
+    use base64::Engine as _;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap(),
+        raw
+    );
+    assert_eq!(
+        fetches[2]
+            .child_text(Page::ItemOperations, "Status")
+            .as_deref(),
+        Some("6")
+    );
+
+    // GetAttachment returns the bytes as the body.
+    let (status, body) = gw
+        .send_raw("GetAttachment", "&AttachmentName=e1%3Aatt1", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, raw);
+
+    // Move e1 to Projects: JMAP updated, and the inbox's next Sync doesn't
+    // report it as deleted.
+    let folders = gw.ok("FolderSync", &folder_sync("0")).await;
+    let projects = folders
+        .child(Page::FolderHierarchy, "Changes")
+        .unwrap()
+        .children_named(Page::FolderHierarchy, "Add")
+        .find(|a| {
+            a.child_text(Page::FolderHierarchy, "DisplayName")
+                .as_deref()
+                == Some("Projects")
+        })
+        .unwrap()
+        .child_text(Page::FolderHierarchy, "ServerId")
+        .unwrap();
+    // FolderSync 0 reset the device's sync state; sync the inbox again.
+    let k = key_of(collection(
+        &gw.ok("Sync", &sync("0", &inbox, None, vec![])).await,
+    ));
+    let resp = gw.ok("Sync", &sync(&k, &inbox, None, vec![])).await;
+    let k = key_of(collection(&resp));
+    let mv = Element::new(Page::Move, "MoveItems")
+        .with_child(
+            Element::new(Page::Move, "Move")
+                .with_child(t(Page::Move, "SrcMsgId", &sid))
+                .with_child(t(Page::Move, "SrcFldId", &inbox))
+                .with_child(t(Page::Move, "DstFldId", &projects)),
+        )
+        .with_child(
+            Element::new(Page::Move, "Move")
+                .with_child(t(Page::Move, "SrcMsgId", &sid))
+                .with_child(t(Page::Move, "SrcFldId", &inbox))
+                .with_child(t(Page::Move, "DstFldId", &inbox)),
+        );
+    let resp = gw.ok("MoveItems", &mv).await;
+    let rs: Vec<_> = resp.children_named(Page::Move, "Response").collect();
+    assert_eq!(rs[0].child_text(Page::Move, "Status").as_deref(), Some("3"));
+    assert_eq!(
+        rs[0].child_text(Page::Move, "DstMsgId"),
+        Some(format!("{projects}:e1"))
+    );
+    assert_eq!(rs[1].child_text(Page::Move, "Status").as_deref(), Some("4"));
+    assert_eq!(
+        fake.lock().unwrap().email("e1")["mailboxIds"],
+        json!({"sub": true})
+    );
+    let (_, body) = gw.send("Sync", Some(&sync(&k, &inbox, None, vec![]))).await;
+    assert!(body.is_none(), "{:?}", body.map(|b| b.to_xml()));
 }
