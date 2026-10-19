@@ -8,6 +8,8 @@ mod item_operations;
 mod move_items;
 mod ping;
 mod provision;
+mod search;
+mod settings;
 mod sync;
 
 use crate::app::AppState;
@@ -26,9 +28,6 @@ pub struct Ctx<'a> {
     pub jmap: JmapClient,
     pub device: Device,
     pub line: &'a RequestLine,
-    /// Negotiated version; read once 16.x-only behaviour (drafts, Find,
-    /// calendar instance edits) lands.
-    #[allow(dead_code)]
     pub version: ProtocolVersion,
 }
 
@@ -92,6 +91,8 @@ pub async fn dispatch(ctx: Ctx<'_>, command: Command, request: Option<Element>) 
         Command::ItemOperations => item_operations::handle(&ctx, request).await,
         Command::GetAttachment => item_operations::get_attachment(&ctx).await,
         Command::MoveItems => move_items::handle(&ctx, request).await,
+        Command::Settings => settings::handle(&ctx, request).await,
+        Command::Search => search::handle(&ctx, request).await,
         Command::SendMail | Command::SmartReply | Command::SmartForward => {
             compose::handle(&ctx, command, request).await
         }

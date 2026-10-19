@@ -215,6 +215,8 @@ impl JmapClient {
 pub struct Identity {
     pub id: String,
     #[serde(default)]
+    pub name: String,
+    #[serde(default)]
     pub email: String,
 }
 
@@ -241,7 +243,7 @@ impl JmapClient {
         let res = self
             .call(
                 "Identity/get",
-                json!({ "accountId": self.account(), "ids": null, "properties": ["id", "email"] }),
+                json!({ "accountId": self.account(), "ids": null, "properties": ["id", "name", "email"] }),
             )
             .await?;
         serde_json::from_value(res.get("list").cloned().unwrap_or(Value::Null))
@@ -324,6 +326,100 @@ impl JmapClient {
     }
 }
 
+/// The account's vacation response (RFC 8621, section 8).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Vacation {
+    #[serde(default)]
+    pub is_enabled: bool,
+    #[serde(default)]
+    pub from_date: Option<String>,
+    #[serde(default)]
+    pub to_date: Option<String>,
+    #[serde(default)]
+    pub text_body: Option<String>,
+    #[serde(default)]
+    pub html_body: Option<String>,
+}
+
+impl JmapClient {
+    pub async fn vacation(&self) -> Result<Vacation, JmapError> {
+        let res = self
+            .call(
+                "VacationResponse/get",
+                json!({ "accountId": self.account(), "ids": ["singleton"] }),
+            )
+            .await?;
+        let first = res
+            .get("list")
+            .and_then(Value::as_array)
+            .and_then(|l| l.first())
+            .cloned()
+            .unwrap_or(Value::Null);
+        if first.is_null() {
+            return Ok(Vacation::default());
+        }
+        serde_json::from_value(first)
+            .map_err(|e| JmapError::Protocol(format!("VacationResponse/get: {e}")))
+    }
+
+    pub async fn set_vacation(&self, v: &Vacation) -> Result<(), JmapError> {
+        let res = self
+            .call(
+                "VacationResponse/set",
+                json!({
+                    "accountId": self.account(),
+                    "update": {"singleton": {
+                        "isEnabled": v.is_enabled,
+                        "fromDate": v.from_date,
+                        "toDate": v.to_date,
+                        "textBody": v.text_body,
+                        "htmlBody": v.html_body,
+                    }},
+                }),
+            )
+            .await?;
+        if let Some(err) = res.get("notUpdated").and_then(|n| n.get("singleton")) {
+            return Err(JmapError::Method {
+                method: "VacationResponse/set".into(),
+                kind: err
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("serverFail")
+                    .to_string(),
+                description: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// One page of a search: matching email IDs, newest first, and the
+    /// total number of matches.
+    pub async fn email_search(
+        &self,
+        filter: Value,
+        position: usize,
+        limit: usize,
+    ) -> Result<(Vec<String>, usize), JmapError> {
+        let res = self
+            .call(
+                "Email/query",
+                json!({
+                    "accountId": self.account(),
+                    "filter": filter,
+                    "sort": [{"property": "receivedAt", "isAscending": false}],
+                    "collapseThreads": false,
+                    "position": position,
+                    "limit": limit,
+                    "calculateTotal": true,
+                }),
+            )
+            .await?;
+        let total = res.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+        Ok((str_list(&res, "ids"), total))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,14 +438,17 @@ mod tests {
         let ids = vec![
             Identity {
                 id: "1".into(),
+                name: String::new(),
                 email: "info@example.org".into(),
             },
             Identity {
                 id: "2".into(),
+                name: String::new(),
                 email: "*@example.org".into(),
             },
             Identity {
                 id: "3".into(),
+                name: String::new(),
                 email: "Bob@Example.org".into(),
             },
         ];

@@ -23,6 +23,7 @@ struct Fake {
     /// (state at which the change happened, email ID)
     log: Vec<(u64, String)>,
     blobs: HashMap<String, Vec<u8>>,
+    vacation: Value,
     /// (identity ID, envelope, stored MIME, kept in a mailbox)
     submissions: Vec<(String, Value, Vec<u8>, bool)>,
 }
@@ -70,6 +71,31 @@ async fn session(State(addr): State<(Shared, SocketAddr)>) -> Json<Value> {
     }))
 }
 
+/// The subset of JMAP email filters the gateway sends.
+fn matches(e: &Value, f: &Value) -> bool {
+    if let Some(op) = f["operator"].as_str() {
+        let mut it = f["conditions"].as_array().unwrap().iter();
+        return match op {
+            "AND" => it.all(|c| matches(e, c)),
+            "OR" => it.any(|c| matches(e, c)),
+            _ => !it.any(|c| matches(e, c)),
+        };
+    }
+    let received = e["receivedAt"].as_str().unwrap();
+    f["inMailbox"]
+        .as_str()
+        .map_or(true, |m| e["mailboxIds"].get(m).is_some())
+        && f["after"].as_str().map_or(true, |a| received > a)
+        && f["before"].as_str().map_or(true, |b| received < b)
+        && f["text"].as_str().map_or(true, |t| {
+            e["subject"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains(&t.to_lowercase())
+        })
+}
+
 fn method(fake: &mut Fake, name: &str, args: &Value) -> (String, Value) {
     let ok = |v: Value| (name.to_string(), v);
     match name {
@@ -95,18 +121,30 @@ fn method(fake: &mut Fake, name: &str, args: &Value) -> (String, Value) {
             ok(json!({"state": fake.state.to_string(), "list": list}))
         }
         "Email/query" => {
-            let mb = args["filter"]["inMailbox"].as_str().unwrap();
-            let after = args["filter"]["after"].as_str();
             let mut list: Vec<&Value> = fake
                 .emails
                 .iter()
-                .filter(|e| e["mailboxIds"].get(mb).is_some())
-                .filter(|e| after.map_or(true, |a| e["receivedAt"].as_str().unwrap() > a))
+                .filter(|e| matches(e, &args["filter"]))
                 .collect();
             list.sort_by(|a, b| b["receivedAt"].as_str().cmp(&a["receivedAt"].as_str()));
+            let total = list.len();
             let pos = args["position"].as_u64().unwrap_or(0) as usize;
-            let ids: Vec<&Value> = list.iter().skip(pos).map(|e| &e["id"]).collect();
-            ok(json!({"ids": ids}))
+            let limit = args["limit"].as_u64().unwrap_or(1000) as usize;
+            let ids: Vec<&Value> = list
+                .iter()
+                .skip(pos)
+                .take(limit)
+                .map(|e| &e["id"])
+                .collect();
+            ok(json!({"ids": ids, "total": total}))
+        }
+        "VacationResponse/get" => ok(json!({"list": [fake.vacation.clone()]})),
+        "VacationResponse/set" => {
+            let patch = args["update"]["singleton"].as_object().unwrap().clone();
+            for (k, v) in patch {
+                fake.vacation[k] = v;
+            }
+            ok(json!({"updated": {"singleton": null}}))
         }
         "Email/changes" => {
             let Ok(since) = args["sinceState"].as_str().unwrap().parse::<u64>() else {
@@ -1026,4 +1064,154 @@ async fn send_reply_and_forward() {
         .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_eq!(fake.lock().unwrap().submissions.len(), 3);
+}
+
+fn settings_t(name: &str, v: &str) -> Element {
+    Element::new(Page::Settings, name).with_text(v)
+}
+
+#[tokio::test]
+async fn settings_and_search() {
+    let (fake, url) = start_fake().await;
+    fake.lock().unwrap().vacation = json!({"id": "singleton", "isEnabled": false});
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+    {
+        let mut f = fake.lock().unwrap();
+        f.add("inv1", "inbox", "2026-10-05T10:00:00Z");
+        f.email("inv1")["subject"] = json!("Invoice October");
+        f.add("inv2", "sub", "2026-10-06T10:00:00Z");
+        f.email("inv2")["subject"] = json!("Invoice November");
+    }
+
+    // Out of office on, then read back; user information.
+    let set = Element::new(Page::Settings, "Settings")
+        .with_child(
+            Element::new(Page::Settings, "Oof").with_child(
+                Element::new(Page::Settings, "Set")
+                    .with_child(settings_t("OofState", "1"))
+                    .with_child(
+                        Element::new(Page::Settings, "OofMessage")
+                            .with_child(Element::new(Page::Settings, "AppliesToInternal"))
+                            .with_child(settings_t("Enabled", "1"))
+                            .with_child(settings_t("ReplyMessage", "On holiday"))
+                            .with_child(settings_t("BodyType", "Text")),
+                    ),
+            ),
+        )
+        .with_child(
+            Element::new(Page::Settings, "DeviceInformation").with_child(
+                Element::new(Page::Settings, "Set").with_child(settings_t("Model", "iPhone16,2")),
+            ),
+        );
+    let resp = gw.ok("Settings", &set).await;
+    assert_eq!(
+        resp.child_text(Page::Settings, "Status").as_deref(),
+        Some("1")
+    );
+    let oof = resp.child(Page::Settings, "Oof").unwrap();
+    assert_eq!(
+        oof.child_text(Page::Settings, "Status").as_deref(),
+        Some("1")
+    );
+    {
+        let f = fake.lock().unwrap();
+        assert_eq!(f.vacation["isEnabled"], json!(true));
+        assert_eq!(f.vacation["textBody"], json!("On holiday"));
+    }
+    let get = Element::new(Page::Settings, "Settings")
+        .with_child(Element::new(Page::Settings, "Oof").with_child(
+            Element::new(Page::Settings, "Get").with_child(settings_t("BodyType", "Text")),
+        ))
+        .with_child(
+            Element::new(Page::Settings, "UserInformation")
+                .with_child(Element::new(Page::Settings, "Get")),
+        );
+    let resp = gw.ok("Settings", &get).await;
+    let g = resp
+        .child(Page::Settings, "Oof")
+        .and_then(|o| o.child(Page::Settings, "Get"))
+        .unwrap();
+    assert_eq!(
+        g.child_text(Page::Settings, "OofState").as_deref(),
+        Some("1")
+    );
+    assert!(resp.to_xml().contains("On holiday"));
+    let xml = resp
+        .child(Page::Settings, "UserInformation")
+        .unwrap()
+        .to_xml();
+    assert!(
+        xml.contains("<PrimarySmtpAddress>alice@example.org</PrimarySmtpAddress>"),
+        "{xml}"
+    );
+    assert!(!xml.contains("*@"), "{xml}");
+
+    // Search: free text across all folders, then limited to the inbox.
+    let search = |collection: Option<&str>| {
+        let mut and = Element::new(Page::Search, "And")
+            .with_child(t(Page::AirSync, "Class", "Email"))
+            .with_child(t(Page::Search, "FreeText", "invoice"));
+        if let Some(c) = collection {
+            and.push(t(Page::AirSync, "CollectionId", c));
+        }
+        Element::new(Page::Search, "Search").with_child(
+            Element::new(Page::Search, "Store")
+                .with_child(t(Page::Search, "Name", "Mailbox"))
+                .with_child(Element::new(Page::Search, "Query").with_child(and))
+                .with_child(Element::new(Page::Search, "Options").with_child(t(
+                    Page::Search,
+                    "Range",
+                    "0-9",
+                ))),
+        )
+    };
+    let store_of = |resp: &Element| {
+        resp.child(Page::Search, "Response")
+            .unwrap()
+            .child(Page::Search, "Store")
+            .unwrap()
+            .clone()
+    };
+    let resp = gw.ok("Search", &search(None)).await;
+    let store = store_of(&resp);
+    assert_eq!(
+        store.child_text(Page::Search, "Total").as_deref(),
+        Some("2")
+    );
+    let results: Vec<_> = store.children_named(Page::Search, "Result").collect();
+    assert_eq!(
+        results[0].child_text(Page::Search, "LongId").as_deref(),
+        Some("inv2")
+    );
+    assert_eq!(
+        store.child_text(Page::Search, "Range").as_deref(),
+        Some("0-1")
+    );
+    let resp = gw.ok("Search", &search(Some(&inbox))).await;
+    let store = store_of(&resp);
+    assert_eq!(
+        store.child_text(Page::Search, "Total").as_deref(),
+        Some("1")
+    );
+    let r = store.child(Page::Search, "Result").unwrap();
+    assert_eq!(
+        r.child_text(Page::AirSync, "CollectionId"),
+        Some(inbox.clone())
+    );
+    assert_eq!(
+        r.child(Page::Search, "Properties")
+            .unwrap()
+            .child_text(Page::Email, "Subject")
+            .as_deref(),
+        Some("Invoice October")
+    );
+
+    // A result opens by LongId.
+    let fetch = Element::new(Page::ItemOperations, "ItemOperations").with_child(
+        Element::new(Page::ItemOperations, "Fetch")
+            .with_child(t(Page::ItemOperations, "Store", "Mailbox"))
+            .with_child(t(Page::Search, "LongId", "inv1")),
+    );
+    let resp = gw.ok("ItemOperations", &fetch).await;
+    assert!(resp.to_xml().contains("Invoice October"));
 }

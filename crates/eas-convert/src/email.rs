@@ -11,6 +11,7 @@ pub const PROPERTIES: &[&str] = &[
     "id",
     "blobId",
     "threadId",
+    "mailboxIds",
     "keywords",
     "size",
     "receivedAt",

@@ -67,10 +67,11 @@ pub struct JmapClient {
     limit: Arc<Semaphore>,
 }
 
-const USING: [&str; 3] = [
+const USING: [&str; 4] = [
     crate::capability::CORE,
     crate::capability::MAIL,
     crate::capability::SUBMISSION,
+    crate::capability::VACATION,
 ];
 
 impl JmapClient {

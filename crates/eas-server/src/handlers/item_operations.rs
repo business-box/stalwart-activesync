@@ -124,6 +124,26 @@ async fn fetch_item(ctx: &Ctx<'_>, fetch: &Element) -> Result<Element, HandlerEr
         .with_child(props))
 }
 
+/// A search result, by the JMAP ID handed out as `LongId`.
+async fn fetch_long_id(
+    ctx: &Ctx<'_>,
+    fetch: &Element,
+    long_id: &str,
+) -> Result<Element, HandlerError> {
+    let tagged =
+        |el: Element| el.with_child(Element::new(Page::Search, "LongId").with_text(long_id));
+    let (_, opts) = parse_options(fetch.child(Page::ItemOperations, "Options"));
+    let mut found = serialise(ctx, &[long_id.to_string()], &opts).await?;
+    let Some((_, _, data)) = found.pop() else {
+        return Ok(tagged(op("Fetch", status::NOT_FOUND)));
+    };
+    let mut props = Element::new(Page::ItemOperations, "Properties");
+    props.children = data.children;
+    Ok(tagged(op("Fetch", status::SUCCESS))
+        .with_child(Element::new(Page::AirSync, "Class").with_text("Email"))
+        .with_child(props))
+}
+
 async fn empty_folder(ctx: &Ctx<'_>, req: &Element) -> Result<Element, HandlerError> {
     let cid = req
         .child_text(Page::AirSync, "CollectionId")
@@ -171,9 +191,10 @@ pub async fn handle(ctx: &Ctx<'_>, request: Option<Element>) -> HandlerResult {
                     fetch_attachment(ctx, &r).await?
                 } else if child.child(Page::AirSync, "ServerId").is_some() {
                     fetch_item(ctx, child).await?
+                } else if let Some(long_id) = child.child_text(Page::Search, "LongId") {
+                    fetch_long_id(ctx, child, &long_id).await?
                 } else {
-                    // LongId (search results) comes with Search.
-                    op("Fetch", status::ACTION_NOT_SUPPORTED)
+                    op("Fetch", status::PROTOCOL_ERROR)
                 }
             }
             "EmptyFolderContents" => empty_folder(ctx, child).await?,

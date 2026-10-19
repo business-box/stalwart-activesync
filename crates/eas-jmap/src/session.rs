@@ -11,6 +11,7 @@ pub mod capability {
     pub const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
     pub const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
     pub const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
+    pub const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
 }
 
 /// Basic credentials as the device sent them. `Debug` never prints the

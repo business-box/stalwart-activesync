@@ -276,8 +276,11 @@ The deciding facts come from Stalwart's own repo and support portal: no EAS plan
 - [x] Prototype the WBXML codec; validate it against the recorded fixtures once they exist.
 - [x] Protocol core: state store, `Provision` with policy keys and remote wipe, policy checks on every command.
 - [x] Mail, first slice: JMAP client, `FolderSync`, mail `Sync` with replay and windows, `GetItemEstimate`, tested end to end against a JMAP test double.
-- [ ] Push: EventSource per user and `Ping`; then replace the polling behind `Sync` `Wait`.
-- [ ] `ItemOperations`, `SendMail`/`SmartReply`/`SmartForward`, `MoveItems`, `Search`, `Settings`.
+- [x] Push: EventSource per user and `Ping`; `Sync` `Wait` on push.
+- [x] `ItemOperations`, `SendMail`/`SmartReply`/`SmartForward`, `MoveItems`, `Search`, `Settings`.
+- [x] Container image built in GitHub Actions and pushed to GHCR.
+- [ ] Try the mail stage against a staging Stalwart and the device lab (M1 gate).
+- [ ] Folder create/update/delete; then phase 3 (calendar).
 
 ## Sources
 
