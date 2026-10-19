@@ -6,6 +6,7 @@ mod app;
 mod auth;
 mod config;
 mod handlers;
+mod push;
 
 #[cfg(test)]
 mod e2e_tests;
@@ -52,6 +53,8 @@ async fn main() {
         store,
         limits: eas_jmap::UserLimits::new(),
         locks: handlers::DeviceLocks::default(),
+        push: push::PushHub::default(),
+        pings: push::PingSlots::default(),
         policy: eas_proto::provision::Policy::default(),
     });
 
@@ -104,6 +107,8 @@ mod tests {
             store,
             limits: eas_jmap::UserLimits::new(),
             locks: handlers::DeviceLocks::default(),
+            push: push::PushHub::default(),
+            pings: push::PingSlots::default(),
             policy: eas_proto::provision::Policy::default(),
         }))
         .layer(axum::extract::connect_info::MockConnectInfo(

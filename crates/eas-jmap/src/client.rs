@@ -100,7 +100,7 @@ impl JmapClient {
         &self.session.mail_account
     }
 
-    fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
+    pub(crate) fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
         let mut req = self
             .endpoint
             .http()
@@ -229,7 +229,7 @@ fn parse_responses(calls: &[Call], value: Value) -> Result<Vec<Value>, JmapError
 
 /// Fills an RFC 6570 level-1 URI template as used by the JMAP session's
 /// download and upload URLs.
-fn expand_template(template: &str, vars: &[(&str, &str)]) -> String {
+pub(crate) fn expand_template(template: &str, vars: &[(&str, &str)]) -> String {
     let mut out = template.to_string();
     for (k, v) in vars {
         let enc: String = url::form_urlencoded::byte_serialize(v.as_bytes())

@@ -405,6 +405,43 @@ impl Store {
         Ok(())
     }
 
+    /// Heartbeat and folder IDs of the device's last `Ping`.
+    pub async fn ping_state(&self, device: i64) -> Result<Option<(u64, Vec<String>)>> {
+        let row = sqlx::query("SELECT heartbeat, folders FROM ping_state WHERE device = ?1")
+            .bind(device)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| {
+            let folders: String = r.get("folders");
+            (
+                r.get::<i64, _>("heartbeat") as u64,
+                folders
+                    .split(',')
+                    .filter(|f| !f.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            )
+        }))
+    }
+
+    pub async fn set_ping_state(
+        &self,
+        device: i64,
+        heartbeat: u64,
+        folders: &[String],
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO ping_state (device, heartbeat, folders) VALUES (?1, ?2, ?3)
+             ON CONFLICT (device) DO UPDATE SET heartbeat = excluded.heartbeat, folders = excluded.folders",
+        )
+        .bind(device)
+        .bind(heartbeat as i64)
+        .bind(folders.join(","))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn sync_state(&self, device: i64, folder: &str) -> Result<Option<SyncState>> {
         let row = sqlx::query("SELECT * FROM sync_state WHERE device = ?1 AND folder = ?2")
             .bind(device)
@@ -532,6 +569,15 @@ mod tests {
         let d = s.device("alice", "DEV1").await.unwrap().unwrap();
         assert_eq!(d.wipe, WipeStatus::Requested);
         assert!(s.device("bob", "DEV1").await.unwrap().is_none());
+
+        assert_eq!(s.ping_state(d.id).await.unwrap(), None);
+        s.set_ping_state(d.id, 480, &["2".into(), "5".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            s.ping_state(d.id).await.unwrap(),
+            Some((480, vec!["2".into(), "5".into()]))
+        );
     }
 
     fn folder(id: &str, jmap: &str) -> Folder {

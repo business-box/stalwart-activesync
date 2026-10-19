@@ -22,7 +22,7 @@ use eas_state::{Folder, Item, SyncCommit, SyncState};
 use eas_wbxml::{Element, Page};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Sync status codes (MS-ASCMD 2.2.3.177.16).
 pub mod status {
@@ -39,8 +39,9 @@ pub mod status {
 
 const DEFAULT_WINDOW: usize = 100;
 const MAX_WINDOW: usize = 512;
-/// How often a waiting `Sync` checks for new mail until push lands.
-const WAIT_POLL: Duration = Duration::from_secs(30);
+/// Recheck a waiting `Sync` even without a push event, in case the
+/// stream is down.
+const WAIT_RECHECK: Duration = Duration::from_secs(600);
 /// Longest wait accepted, in seconds (MS-ASCMD: 59 minutes).
 const MAX_WAIT_SECS: u64 = 59 * 60;
 
@@ -341,19 +342,23 @@ pub async fn handle(ctx: &Ctx<'_>, request: Option<Element>) -> HandlerResult {
         return Ok(wbxml(&top_status(status::INCOMPLETE_REQUEST)));
     }
 
-    let deadline = parsed.wait.map(|s| Instant::now() + Duration::from_secs(s));
+    let deadline = parsed
+        .wait
+        .map(|s| tokio::time::Instant::now() + Duration::from_secs(s));
+    // Subscribe before the first pass so a change during it still wakes us.
+    let feed = deadline.map(|_| ctx.state.push.subscribe(&ctx.jmap));
+    let mut rx = feed.as_ref().map(|f| f.receiver());
     let mut first = true;
     loop {
-        let (response, seen_state) = {
+        let response = {
             let _guard = ctx.state.locks.get(dev).lock_owned().await;
-            let seen_state = ctx.jmap.email_state().await?;
             let mut out = Vec::new();
             for coll in &parsed.collections {
                 if let Some(el) = sync_collection(ctx, coll, parsed.window_size, first).await? {
                     out.push(el);
                 }
             }
-            (out, seen_state)
+            out
         };
         if !response.is_empty() {
             let mut cols = Element::new(Page::AirSync, "Collections");
@@ -362,21 +367,26 @@ pub async fn handle(ctx: &Ctx<'_>, request: Option<Element>) -> HandlerResult {
             }
             return Ok(wbxml(&Element::new(Page::AirSync, "Sync").with_child(cols)));
         }
-        let Some(deadline) = deadline else {
+        let (Some(deadline), Some(rx)) = (deadline, rx.as_mut()) else {
             return Ok(empty());
         };
-        // Nothing changed: hold the request until mail arrives or the wait
-        // runs out. Polling the JMAP state is a stopgap until the push hub.
+        // Nothing changed: hold the request until push says mail moved, the
+        // periodic recheck comes round, or the wait runs out.
         first = false;
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(empty());
+        let recheck = (tokio::time::Instant::now() + WAIT_RECHECK).min(deadline);
+        tokio::select! {
+            r = rx.changed() => {
+                if r.is_err() {
+                    tokio::time::sleep_until(recheck).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    rx.borrow_and_update();
+                }
             }
-            tokio::time::sleep(WAIT_POLL.min(deadline - now)).await;
-            if ctx.jmap.email_state().await? != seen_state {
-                break;
-            }
+            _ = tokio::time::sleep_until(recheck) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(empty());
         }
     }
 }

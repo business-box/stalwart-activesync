@@ -1,7 +1,7 @@
 //! End-to-end tests: real WBXML requests through the router against an
 //! in-process fake of the parts of Stalwart's JMAP API the gateway uses.
 
-use crate::{app, auth, config, handlers};
+use crate::{app, auth, config, handlers, push};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -160,6 +160,31 @@ async fn api(State(st): State<(Shared, SocketAddr)>, Json(req): Json<Value>) -> 
     Json(json!({"methodResponses": responses, "sessionState": "s"}))
 }
 
+/// EventSource: a `StateChange` whenever the fake's state moves.
+async fn event_source(State(st): State<(Shared, SocketAddr)>) -> axum::response::Response {
+    let shared = st.0;
+    let start = shared.lock().unwrap().state;
+    let stream = futures_util::stream::unfold(start, move |last| {
+        let shared = shared.clone();
+        async move {
+            loop {
+                let now = shared.lock().unwrap().state;
+                if now != last {
+                    let ev = format!(
+                        "event: state\ndata: {{\"@type\":\"StateChange\",\"changed\":{{\"acc\":{{\"Email\":\"{now}\"}}}}}}\n\n"
+                    );
+                    return Some((Ok::<_, std::convert::Infallible>(ev), now));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    });
+    axum::response::Response::builder()
+        .header("Content-Type", "text/event-stream")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
 async fn start_fake() -> (Shared, String) {
     let shared: Shared = Arc::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -171,6 +196,7 @@ async fn start_fake() -> (Shared, String) {
             "/download/{acc}/{blob}/{name}",
             get(|| async { "Subject: raw\r\n\r\nraw body" }),
         )
+        .route("/es", get(event_source))
         .with_state((shared.clone(), addr));
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     (shared, format!("http://{addr}/"))
@@ -201,6 +227,8 @@ impl Gateway {
             store: eas_state::Store::memory().await.unwrap(),
             limits: eas_jmap::UserLimits::new(),
             locks: handlers::DeviceLocks::default(),
+            push: push::PushHub::default(),
+            pings: push::PingSlots::default(),
             policy: eas_proto::provision::Policy::default(),
         }))
         .layer(axum::extract::connect_info::MockConnectInfo(
@@ -564,4 +592,115 @@ async fn provision_folder_sync_and_mail_sync() {
             .as_deref(),
         Some("12")
     );
+}
+
+fn ping(heartbeat: Option<&str>, folders: &[&str]) -> Element {
+    let mut p = Element::new(Page::Ping, "Ping");
+    if let Some(h) = heartbeat {
+        p.push(t(Page::Ping, "HeartbeatInterval", h));
+    }
+    if !folders.is_empty() {
+        let mut fs = Element::new(Page::Ping, "Folders");
+        for f in folders {
+            fs.push(
+                Element::new(Page::Ping, "Folder")
+                    .with_child(t(Page::Ping, "Id", f))
+                    .with_child(t(Page::Ping, "Class", "Email")),
+            );
+        }
+        p.push(fs);
+    }
+    p
+}
+
+/// Provisioned gateway with the inbox fully synced; returns the inbox ID.
+async fn synced_gateway(fake: &Shared, url: &str) -> (Gateway, String) {
+    fake.lock().unwrap().add("e1", "inbox", "2026-10-01T10:00:00Z");
+    let mut gw = Gateway::new(url).await;
+    let temp = policy_key(&gw.ok("Provision", &provision_request(None)).await);
+    let key = policy_key(&gw.ok("Provision", &provision_request(Some(&temp))).await);
+    gw.policy_key = Some(key);
+    let resp = gw.ok("FolderSync", &folder_sync("0")).await;
+    let inbox = resp
+        .child(Page::FolderHierarchy, "Changes")
+        .unwrap()
+        .children_named(Page::FolderHierarchy, "Add")
+        .find(|a| a.child_text(Page::FolderHierarchy, "Type").as_deref() == Some("2"))
+        .unwrap()
+        .child_text(Page::FolderHierarchy, "ServerId")
+        .unwrap();
+    let k = key_of(collection(&gw.ok("Sync", &sync("0", &inbox, None, vec![])).await));
+    let resp = gw.ok("Sync", &sync(&k, &inbox, None, vec![])).await;
+    assert_eq!(commands(collection(&resp), "Add").len(), 1);
+    (gw, inbox)
+}
+
+fn ping_status(resp: &Element) -> String {
+    resp.child_text(Page::Ping, "Status").unwrap()
+}
+
+#[tokio::test]
+async fn ping_wakes_on_push_and_validates() {
+    let (fake, url) = start_fake().await;
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+
+    // Parameter checks.
+    let (_, resp) = gw.send("Ping", None).await;
+    assert_eq!(ping_status(&resp.unwrap()), "3");
+    let resp = gw.ok("Ping", &ping(Some("10"), &[&inbox])).await;
+    assert_eq!(ping_status(&resp), "5");
+    assert_eq!(
+        resp.child_text(Page::Ping, "HeartbeatInterval").as_deref(),
+        Some("60")
+    );
+    let resp = gw.ok("Ping", &ping(Some("60"), &["999"])).await;
+    assert_eq!(ping_status(&resp), "7");
+
+    // Nothing pending: the Ping waits until push reports new mail.
+    let gw = Arc::new(gw);
+    let started = std::time::Instant::now();
+    let pinging = {
+        let gw = gw.clone();
+        let body = ping(Some("600"), &[&inbox]);
+        tokio::spawn(async move { gw.ok("Ping", &body).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!pinging.is_finished(), "Ping returned before any change");
+    fake.lock().unwrap().add("e2", "inbox", "2026-10-02T10:00:00Z");
+    let resp = tokio::time::timeout(Duration::from_secs(10), pinging)
+        .await
+        .expect("Ping woken by push")
+        .unwrap();
+    assert_eq!(ping_status(&resp), "2");
+    let folders = resp.child(Page::Ping, "Folders").unwrap();
+    assert_eq!(folders.child_text(Page::Ping, "Folder"), Some(inbox.clone()));
+    assert!(started.elapsed() < Duration::from_secs(10));
+
+    // Pending changes answer at once; an empty Ping reuses the last folders.
+    let (_, resp) = gw.send("Ping", None).await;
+    assert_eq!(ping_status(&resp.unwrap()), "2");
+}
+
+#[tokio::test]
+async fn new_ping_ends_the_waiting_one() {
+    let (fake, url) = start_fake().await;
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+    let gw = Arc::new(gw);
+    let first = {
+        let gw = gw.clone();
+        let body = ping(Some("600"), &[&inbox]);
+        tokio::spawn(async move { gw.ok("Ping", &body).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let second = {
+        let gw = gw.clone();
+        let body = ping(Some("600"), &[&inbox]);
+        tokio::spawn(async move { gw.ok("Ping", &body).await })
+    };
+    let resp = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("first Ping ended")
+        .unwrap();
+    assert_eq!(ping_status(&resp), "1");
+    second.abort();
 }

@@ -1,6 +1,7 @@
 use crate::auth::{basic_credentials, Authenticator};
 use crate::config::Config;
 use crate::handlers::{self, Ctx, DeviceLocks};
+use crate::push::{PingSlots, PushHub};
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -21,6 +22,8 @@ pub struct AppState {
     pub store: Store,
     pub limits: UserLimits,
     pub locks: DeviceLocks,
+    pub push: PushHub,
+    pub pings: PingSlots,
     pub policy: Policy,
 }
 

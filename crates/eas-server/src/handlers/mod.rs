@@ -3,6 +3,7 @@
 
 mod estimate;
 mod folder_sync;
+mod ping;
 mod provision;
 mod sync;
 
@@ -82,6 +83,7 @@ pub async fn dispatch(ctx: Ctx<'_>, command: Command, request: Option<Element>) 
         Command::FolderSync => folder_sync::handle(&ctx, request).await,
         Command::Sync => sync::handle(&ctx, request).await,
         Command::GetItemEstimate => estimate::handle(&ctx, request).await,
+        Command::Ping => ping::handle(&ctx, request).await,
         other => {
             tracing::info!(user = %ctx.device.username, device = %ctx.line.device_id, command = %other, "command not implemented yet");
             Ok((

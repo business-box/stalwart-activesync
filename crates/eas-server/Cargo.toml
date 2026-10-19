@@ -31,6 +31,7 @@ sha2 = "0.10"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false }
 
 [lints]
 workspace = true
