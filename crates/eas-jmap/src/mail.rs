@@ -210,6 +210,120 @@ impl JmapClient {
     }
 }
 
+/// A sending identity.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Identity {
+    pub id: String,
+    #[serde(default)]
+    pub email: String,
+}
+
+/// Picks the identity for a sender address: an exact match, then a
+/// `*@domain` wildcard, then the first one.
+pub fn pick_identity<'a>(identities: &'a [Identity], from: &str) -> Option<&'a Identity> {
+    let from = from.to_ascii_lowercase();
+    let domain = from.rsplit_once('@').map(|(_, d)| d.to_string());
+    identities
+        .iter()
+        .find(|i| i.email.to_ascii_lowercase() == from)
+        .or_else(|| {
+            identities.iter().find(|i| {
+                domain
+                    .as_ref()
+                    .is_some_and(|d| i.email.to_ascii_lowercase() == format!("*@{d}"))
+            })
+        })
+        .or_else(|| identities.first())
+}
+
+impl JmapClient {
+    pub async fn identities(&self) -> Result<Vec<Identity>, JmapError> {
+        let res = self
+            .call(
+                "Identity/get",
+                json!({ "accountId": self.account(), "ids": null, "properties": ["id", "email"] }),
+            )
+            .await?;
+        serde_json::from_value(res.get("list").cloned().unwrap_or(Value::Null))
+            .map_err(|e| JmapError::Protocol(format!("Identity/get: {e}")))
+    }
+
+    /// Stores `mime` in `mailbox` and submits it with an explicit envelope.
+    /// With `keep == false` the stored copy is destroyed once submitted.
+    /// Returns the email's ID.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit(
+        &self,
+        mime: Vec<u8>,
+        identity_id: &str,
+        mail_from: &str,
+        rcpt_to: &[String],
+        mailbox: &str,
+        keep: bool,
+    ) -> Result<String, JmapError> {
+        let blob = self.upload(mime, "message/rfc822").await?;
+        let mut submission = json!({
+            "accountId": self.account(),
+            "create": {
+                "s": {
+                    "identityId": identity_id,
+                    "emailId": "#m",
+                    "envelope": {
+                        "mailFrom": {"email": mail_from},
+                        "rcptTo": rcpt_to.iter().map(|r| json!({"email": r})).collect::<Vec<_>>(),
+                    },
+                }
+            },
+        });
+        if !keep {
+            submission["onSuccessDestroyEmail"] = json!(["#s"]);
+        }
+        let res = self
+            .batch(vec![
+                Call::new(
+                    "Email/import",
+                    json!({
+                        "accountId": self.account(),
+                        "emails": {"m": {
+                            "blobId": blob,
+                            "mailboxIds": {mailbox: true},
+                            "keywords": {"$seen": true},
+                        }},
+                    }),
+                    "i",
+                ),
+                Call::new("EmailSubmission/set", submission, "s"),
+            ])
+            .await?;
+        let not_created = |v: &Value, key: &str, method: &str| -> Result<(), JmapError> {
+            match v.get("notCreated").and_then(|n| n.get(key)) {
+                Some(err) => Err(JmapError::Method {
+                    method: method.into(),
+                    kind: err
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("serverFail")
+                        .to_string(),
+                    description: err
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                }),
+                None => Ok(()),
+            }
+        };
+        not_created(&res[0], "m", "Email/import")?;
+        not_created(&res[1], "s", "EmailSubmission/set")?;
+        res[0]
+            .get("created")
+            .and_then(|c| c.get("m"))
+            .and_then(|m| m.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| JmapError::Protocol("Email/import without created id".into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +335,27 @@ mod tests {
         assert_eq!(m.parent_id, None);
         assert_eq!(m.role.as_deref(), Some("inbox"));
         assert_eq!(m.sort_order, 0);
+    }
+
+    #[test]
+    fn identity_choice() {
+        let ids = vec![
+            Identity {
+                id: "1".into(),
+                email: "info@example.org".into(),
+            },
+            Identity {
+                id: "2".into(),
+                email: "*@example.org".into(),
+            },
+            Identity {
+                id: "3".into(),
+                email: "Bob@Example.org".into(),
+            },
+        ];
+        assert_eq!(pick_identity(&ids, "bob@example.org").unwrap().id, "3");
+        assert_eq!(pick_identity(&ids, "sales@example.org").unwrap().id, "2");
+        assert_eq!(pick_identity(&ids, "x@other.org").unwrap().id, "1");
+        assert!(pick_identity(&[], "x@other.org").is_none());
     }
 }

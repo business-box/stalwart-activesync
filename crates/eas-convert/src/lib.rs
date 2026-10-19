@@ -7,5 +7,6 @@
 //! `TIME_ZONE_INFORMATION` blobs, and JSContact to EAS contacts with
 //! patch-only updates.
 
+pub mod compose;
 pub mod email;
 pub mod text;

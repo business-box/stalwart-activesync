@@ -1,6 +1,7 @@
 //! Command handlers. Each takes the decoded request and a [`Ctx`] and
 //! returns the HTTP response.
 
+mod compose;
 mod estimate;
 mod folder_sync;
 mod item_operations;
@@ -79,6 +80,8 @@ pub fn empty() -> Response {
     StatusCode::OK.into_response()
 }
 
+pub use compose::legacy_request;
+
 pub async fn dispatch(ctx: Ctx<'_>, command: Command, request: Option<Element>) -> Response {
     let result = match command {
         Command::Provision => provision::handle(&ctx, request).await,
@@ -89,6 +92,9 @@ pub async fn dispatch(ctx: Ctx<'_>, command: Command, request: Option<Element>) 
         Command::ItemOperations => item_operations::handle(&ctx, request).await,
         Command::GetAttachment => item_operations::get_attachment(&ctx).await,
         Command::MoveItems => move_items::handle(&ctx, request).await,
+        Command::SendMail | Command::SmartReply | Command::SmartForward => {
+            compose::handle(&ctx, command, request).await
+        }
         other => {
             tracing::info!(user = %ctx.device.username, device = %ctx.line.device_id, command = %other, "command not implemented yet");
             Ok((

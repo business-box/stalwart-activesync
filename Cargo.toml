@@ -24,6 +24,8 @@ eas-convert = { path = "crates/eas-convert" }
 eas-state = { path = "crates/eas-state" }
 thiserror = "2"
 serde_json = "1"
+mail-parser = "0.11"
+mail-builder = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 base64 = "0.22"
 form_urlencoded = "1"

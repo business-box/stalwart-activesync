@@ -11,6 +11,8 @@ rust-version.workspace = true
 eas-wbxml.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+mail-parser.workspace = true
+mail-builder.workspace = true
 
 [lints]
 workspace = true

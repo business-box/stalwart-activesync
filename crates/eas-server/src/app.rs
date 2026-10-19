@@ -141,8 +141,15 @@ async fn activesync_post(
         Err(e) => return jmap_error(e),
     };
 
+    let raw_mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().starts_with("message/rfc822"));
     let request = if body.is_empty() {
         None
+    } else if raw_mime {
+        // Older clients post the message itself with options in the URI.
+        handlers::legacy_request(&line, command, &body)
     } else {
         match eas_wbxml::decode(&body) {
             Ok(el) => Some(el),

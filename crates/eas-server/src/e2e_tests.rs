@@ -10,6 +10,7 @@ use axum::{Json, Router};
 use eas_wbxml::{Element, Page};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,6 +22,9 @@ struct Fake {
     state: u64,
     /// (state at which the change happened, email ID)
     log: Vec<(u64, String)>,
+    blobs: HashMap<String, Vec<u8>>,
+    /// (identity ID, envelope, stored MIME, kept in a mailbox)
+    submissions: Vec<(String, Value, Vec<u8>, bool)>,
 }
 
 type Shared = Arc<Mutex<Fake>>;
@@ -72,6 +76,7 @@ fn method(fake: &mut Fake, name: &str, args: &Value) -> (String, Value) {
         "Mailbox/get" => ok(json!({"state": "m1", "list": [
             {"id": "inbox", "name": "Inbox", "role": "inbox", "parentId": null},
             {"id": "trash", "name": "Trash", "role": "trash", "parentId": null},
+            {"id": "sent", "name": "Sent", "role": "sent", "parentId": null},
             {"id": "sub", "name": "Projects", "role": null, "parentId": "inbox"}
         ]})),
         "Email/get" => {
@@ -116,6 +121,46 @@ fn method(fake: &mut Fake, name: &str, args: &Value) -> (String, Value) {
             ok(
                 json!({"newState": fake.state.to_string(), "created": [], "updated": updated, "destroyed": [], "hasMoreChanges": false}),
             )
+        }
+        "Identity/get" => ok(json!({"state": "i1", "list": [
+            {"id": "id-any", "email": "*@example.org"},
+            {"id": "id-alice", "email": "alice@example.org"}
+        ]})),
+        "Email/import" => {
+            let m = &args["emails"]["m"];
+            let blob = fake.blobs[m["blobId"].as_str().unwrap()].clone();
+            let id = format!("sent{}", fake.emails.len());
+            fake.emails.push(json!({
+                "id": id, "blobId": m["blobId"], "threadId": "t", "mailboxIds": m["mailboxIds"],
+                "keywords": m["keywords"], "receivedAt": "2026-10-19T00:00:00Z",
+                "subject": "sent", "textBody": [], "htmlBody": [], "attachments": [], "bodyValues": {},
+                "raw": String::from_utf8_lossy(&blob),
+            }));
+            fake.bump(&id);
+            ok(json!({"created": {"m": {"id": id}}}))
+        }
+        "EmailSubmission/set" => {
+            let s = &args["create"]["s"];
+            let email_id = fake.emails.last().unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let raw = fake.email(&email_id)["raw"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .to_vec();
+            let keep = args.get("onSuccessDestroyEmail").is_none();
+            if !keep {
+                fake.emails.retain(|e| e["id"] != email_id.as_str());
+            }
+            fake.submissions.push((
+                s["identityId"].as_str().unwrap().to_string(),
+                s["envelope"].clone(),
+                raw,
+                keep,
+            ));
+            ok(json!({"created": {"s": {"id": "sub1"}}}))
         }
         "Email/set" => {
             let mut not_updated = serde_json::Map::new();
@@ -197,6 +242,17 @@ async fn start_fake() -> (Shared, String) {
             get(|| async { "Subject: raw\r\n\r\nraw body" }),
         )
         .route("/es", get(event_source))
+        .route(
+            "/upload/{acc}/",
+            post(
+                |State(st): State<(Shared, SocketAddr)>, body: axum::body::Bytes| async move {
+                    let mut f = st.0.lock().unwrap();
+                    let id = format!("up{}", f.blobs.len());
+                    f.blobs.insert(id.clone(), body.to_vec());
+                    Json(json!({"blobId": id, "type": "message/rfc822", "size": body.len()}))
+                },
+            ),
+        )
         .with_state((shared.clone(), addr));
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     (shared, format!("http://{addr}/"))
@@ -254,17 +310,27 @@ impl Gateway {
         extra: &str,
         body: Option<&Element>,
     ) -> (StatusCode, Vec<u8>) {
+        let body = body.map(eas_wbxml::encode).unwrap_or_default();
+        self.post(cmd, extra, eas_wbxml::CONTENT_TYPE, body).await
+    }
+
+    async fn post(
+        &self,
+        cmd: &str,
+        extra: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, Vec<u8>) {
         let mut req = Request::post(format!(
             "/Microsoft-Server-ActiveSync?Cmd={cmd}&User=alice&DeviceId=DEV1&DeviceType=iPhone{extra}"
         ))
         .header("MS-ASProtocolVersion", "16.1")
         // alice:secret
         .header("Authorization", "Basic YWxpY2U6c2VjcmV0")
-        .header("Content-Type", eas_wbxml::CONTENT_TYPE);
+        .header("Content-Type", content_type);
         if let Some(k) = &self.policy_key {
             req = req.header("X-MS-PolicyKey", k);
         }
-        let body = body.map(eas_wbxml::encode).unwrap_or_default();
         let resp = self
             .app
             .clone()
@@ -407,7 +473,7 @@ async fn provision_folder_sync_and_mail_sync() {
         changes
             .child_text(Page::FolderHierarchy, "Count")
             .as_deref(),
-        Some("3")
+        Some("4")
     );
     let adds: Vec<_> = changes
         .children_named(Page::FolderHierarchy, "Add")
@@ -846,4 +912,118 @@ async fn item_operations_and_move_items() {
     );
     let (_, body) = gw.send("Sync", Some(&sync(&k, &inbox, None, vec![]))).await;
     assert!(body.is_none(), "{:?}", body.map(|b| b.to_xml()));
+}
+
+fn compose(cmd: &str, client_id: &str, source: Option<&str>, mime: &str) -> Element {
+    let mut el = Element::new(Page::ComposeMail, cmd)
+        .with_child(t(Page::ComposeMail, "ClientId", client_id))
+        .with_child(Element::new(Page::ComposeMail, "SaveInSentItems"));
+    if let Some(item) = source {
+        el.push(Element::new(Page::ComposeMail, "Source").with_child(t(
+            Page::ComposeMail,
+            "ItemId",
+            item,
+        )));
+    }
+    el.with_child(Element::new(Page::ComposeMail, "Mime").with_opaque(mime.as_bytes().to_vec()))
+}
+
+#[tokio::test]
+async fn send_reply_and_forward() {
+    let (fake, url) = start_fake().await;
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+    let mime = "From: Alice <alice@example.org>\r\nTo: bob@example.org\r\nBcc: secret@example.org\r\nSubject: Hi\r\n\r\nNew text\r\n";
+
+    // SendMail: empty 200, Bcc in the envelope only, copy kept in Sent.
+    let (status, body) = gw
+        .send("SendMail", Some(&compose("SendMail", "c1", None, mime)))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_none(), "{:?}", body.map(|b| b.to_xml()));
+    {
+        let f = fake.lock().unwrap();
+        let (identity, envelope, raw, keep) = &f.submissions[0];
+        assert_eq!(identity, "id-alice");
+        assert_eq!(envelope["mailFrom"]["email"], "alice@example.org");
+        assert_eq!(
+            envelope["rcptTo"],
+            json!([{"email": "bob@example.org"}, {"email": "secret@example.org"}])
+        );
+        let raw = String::from_utf8_lossy(raw);
+        assert!(!raw.contains("secret@"), "{raw}");
+        assert!(*keep);
+    }
+
+    // The same ClientId again: not sent twice.
+    let resp = gw
+        .ok("SendMail", &compose("SendMail", "c1", None, mime))
+        .await;
+    assert_eq!(
+        resp.child_text(Page::ComposeMail, "Status").as_deref(),
+        Some("118")
+    );
+    assert_eq!(fake.lock().unwrap().submissions.len(), 1);
+
+    // SmartReply quotes the original and marks it answered.
+    let reply = "From: alice@example.org\r\nTo: bob@example.org\r\nSubject: Re: Subject e1\r\n\r\nThanks!\r\n";
+    let (status, body) = gw
+        .send(
+            "SmartReply",
+            Some(&compose(
+                "SmartReply",
+                "c2",
+                Some(&format!("{inbox}:e1")),
+                reply,
+            )),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{:?}", body.map(|b| b.to_xml()));
+    {
+        let mut f = fake.lock().unwrap();
+        let raw = String::from_utf8_lossy(&f.submissions[1].2).to_string();
+        assert!(raw.contains("Thanks!"), "{raw}");
+        assert!(raw.contains("> hello"), "{raw}");
+        assert_eq!(f.email("e1")["keywords"]["$answered"], json!(true));
+    }
+
+    // SmartForward of an unknown item: 150.
+    let resp = gw
+        .ok(
+            "SmartForward",
+            &compose("SmartForward", "c3", Some(&format!("{inbox}:gone")), reply),
+        )
+        .await;
+    assert_eq!(
+        resp.child_text(Page::ComposeMail, "Status").as_deref(),
+        Some("150")
+    );
+
+    // Message without recipients: 119.
+    let resp = gw
+        .ok(
+            "SendMail",
+            &compose(
+                "SendMail",
+                "c4",
+                None,
+                "From: alice@example.org\r\nSubject: x\r\n\r\nx",
+            ),
+        )
+        .await;
+    assert_eq!(
+        resp.child_text(Page::ComposeMail, "Status").as_deref(),
+        Some("119")
+    );
+
+    // Older clients post raw MIME with options in the URI.
+    let (status, body) = gw
+        .post(
+            "SendMail",
+            "&SaveInSent=T",
+            "message/rfc822",
+            mime.as_bytes().to_vec(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(fake.lock().unwrap().submissions.len(), 3);
 }

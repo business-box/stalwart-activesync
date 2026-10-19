@@ -296,6 +296,36 @@ impl Store {
         Ok(())
     }
 
+    /// The JMAP ID recorded for a device-side `ClientId`, if any; lets a
+    /// retried send or add be answered instead of repeated.
+    pub async fn client_id(&self, device: i64, client_id: &str) -> Result<Option<String>> {
+        let row =
+            sqlx::query("SELECT jmap_id FROM client_ids WHERE device = ?1 AND client_id = ?2")
+                .bind(device)
+                .bind(client_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| r.get("jmap_id")))
+    }
+
+    pub async fn record_client_id(
+        &self,
+        device: i64,
+        client_id: &str,
+        jmap_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO client_ids (device, client_id, jmap_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT (device, client_id) DO UPDATE SET jmap_id = excluded.jmap_id",
+        )
+        .bind(device)
+        .bind(client_id)
+        .bind(jmap_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn hierarchy(&self, device: i64) -> Result<Option<HierarchyState>> {
         let row = sqlx::query("SELECT * FROM hierarchy_state WHERE device = ?1")
             .bind(device)
@@ -605,6 +635,13 @@ mod tests {
         let d = s.device("alice", "DEV1").await.unwrap().unwrap();
         assert_eq!(d.wipe, WipeStatus::Requested);
         assert!(s.device("bob", "DEV1").await.unwrap().is_none());
+
+        assert_eq!(s.client_id(d.id, "c1").await.unwrap(), None);
+        s.record_client_id(d.id, "c1", "m9").await.unwrap();
+        assert_eq!(
+            s.client_id(d.id, "c1").await.unwrap().as_deref(),
+            Some("m9")
+        );
 
         assert_eq!(s.ping_state(d.id).await.unwrap(), None);
         s.set_ping_state(d.id, 480, &["2".into(), "5".into()])
