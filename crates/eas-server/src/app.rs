@@ -172,7 +172,7 @@ async fn activesync_request(
     let Some(creds) = basic_credentials(&headers) else {
         return unauthorized();
     };
-    let ip = client_ip(&state, &headers, peer);
+    let ip = client_ip(state, &headers, peer);
     let session = match state.auth.authenticate(&creds, ip).await {
         Ok(s) => s,
         Err(e) => return jmap_error(e),
@@ -253,7 +253,7 @@ async fn activesync_request(
         &state.limits,
     );
     let ctx = Ctx {
-        state: &state,
+        state,
         jmap,
         device,
         line: &line,
