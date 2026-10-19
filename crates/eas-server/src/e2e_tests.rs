@@ -1,7 +1,7 @@
 //! End-to-end tests: real WBXML requests through the router against an
 //! in-process fake of the parts of Stalwart's JMAP API the gateway uses.
 
-use crate::{app, auth, config, handlers, push};
+use crate::{app, auth, config, handlers, metrics, push};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -353,6 +353,7 @@ impl Gateway {
             auth_cache_secs: 300,
             db_url: "sqlite::memory:".into(),
             require_provisioning: true,
+            admin_token: Some("admintoken".into()),
         };
         let endpoint = eas_jmap::StalwartEndpoint::new(&config.stalwart_url).unwrap();
         let auth = auth::Authenticator::new(endpoint, Duration::from_secs(300));
@@ -364,6 +365,7 @@ impl Gateway {
             locks: handlers::DeviceLocks::default(),
             push: push::PushHub::default(),
             pings: push::PingSlots::default(),
+            metrics: metrics::Metrics::default(),
             policy: eas_proto::provision::Policy::default(),
         }))
         .layer(axum::extract::connect_info::MockConnectInfo(
@@ -1411,4 +1413,91 @@ async fn folder_create_update_delete() {
         )
         .await;
     assert_eq!(status(&r), "4");
+}
+
+impl Gateway {
+    async fn admin(&self, method: &str, path: &str, token: Option<&str>) -> (StatusCode, Value) {
+        let mut req = Request::builder().method(method).uri(path);
+        if let Some(t) = token {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        let resp = self
+            .app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()));
+        (status, v)
+    }
+}
+
+#[tokio::test]
+async fn admin_api_and_metrics() {
+    let (fake, url) = start_fake().await;
+    let (gw, inbox) = synced_gateway(&fake, &url).await;
+
+    let (status, _) = gw.admin("GET", "/admin/devices", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = gw.admin("GET", "/admin/devices", Some("wrong")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, list) = gw
+        .admin(
+            "GET",
+            "/admin/devices?user=alice@example.org",
+            Some("admintoken"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list[0]["deviceId"], "DEV1");
+    assert_eq!(list[0]["provisioned"], true);
+    let id = list[0]["id"].as_i64().unwrap();
+
+    // Wipe: commands get 140, Provision hands out the wipe.
+    let (status, _) = gw
+        .admin(
+            "POST",
+            &format!("/admin/devices/{id}/wipe"),
+            Some("admintoken"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let resp = gw.ok("Sync", &sync("1-x", &inbox, None, vec![])).await;
+    assert_eq!(
+        resp.child_text(Page::AirSync, "Status").as_deref(),
+        Some("140")
+    );
+    let resp = gw.ok("Provision", &provision_request(None)).await;
+    assert!(resp.child(Page::Provision, "RemoteWipe").is_some());
+
+    // Deleting the device cancels the wipe; it registers again unprovisioned.
+    let (status, _) = gw
+        .admin(
+            "DELETE",
+            &format!("/admin/devices/{id}"),
+            Some("admintoken"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let resp = gw.ok("FolderSync", &folder_sync("0")).await;
+    assert_eq!(
+        resp.child_text(Page::FolderHierarchy, "Status").as_deref(),
+        Some("142")
+    );
+    let (status, _) = gw
+        .admin("POST", "/admin/devices/99999/block", Some("admintoken"))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, text) = gw.admin("GET", "/metrics", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = text.as_str().unwrap().to_string();
+    assert!(
+        text.contains("eas_requests_total{command=\"Sync\",status=\"200\"}"),
+        "{text}"
+    );
+    assert!(text.contains("eas_devices 1"), "{text}");
 }

@@ -68,6 +68,35 @@ pub struct Device {
     pub last_sync_request: Option<Vec<u8>>,
 }
 
+/// A device as the admin API lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub id: i64,
+    pub username: String,
+    pub device_id: String,
+    pub device_type: String,
+    pub user_agent: Option<String>,
+    pub protocol_version: Option<String>,
+    pub model: Option<String>,
+    pub friendly_name: Option<String>,
+    pub os: Option<String>,
+    pub provisioned: bool,
+    pub wipe: WipeStatus,
+    pub blocked: bool,
+    pub first_seen: i64,
+    pub last_seen: i64,
+}
+
+impl WipeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WipeStatus::None => "none",
+            WipeStatus::Requested => "requested",
+            WipeStatus::Acknowledged => "acknowledged",
+        }
+    }
+}
+
 /// A folder as the device knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Folder {
@@ -233,6 +262,93 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.as_ref().map(device_from_row))
+    }
+
+    /// All devices, or one user's, most recently seen first.
+    pub async fn list_devices(&self, username: Option<&str>) -> Result<Vec<DeviceInfo>> {
+        let rows = sqlx::query(
+            "SELECT * FROM devices WHERE ?1 IS NULL OR username = ?1 ORDER BY last_seen DESC",
+        )
+        .bind(username)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| DeviceInfo {
+                id: r.get("id"),
+                username: r.get("username"),
+                device_id: r.get("device_id"),
+                device_type: r.get("device_type"),
+                user_agent: r.get("user_agent"),
+                protocol_version: r.get("protocol_version"),
+                model: r.get("model"),
+                friendly_name: r.get("friendly_name"),
+                os: r.get("os"),
+                provisioned: r.get::<Option<i64>, _>("policy_key").is_some(),
+                wipe: WipeStatus::from_i64(r.get("wipe_status")),
+                blocked: r.get::<i64, _>("blocked") != 0,
+                first_seen: r.get("first_seen"),
+                last_seen: r.get("last_seen"),
+            })
+            .collect())
+    }
+
+    /// Returns false if no such device exists.
+    pub async fn set_blocked(&self, device: i64, blocked: bool) -> Result<bool> {
+        let r = sqlx::query("UPDATE devices SET blocked = ?2 WHERE id = ?1")
+            .bind(device)
+            .bind(blocked as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Forgets everything the device was told: it has to provision again
+    /// and resync every folder. Keeps the device record and its block and
+    /// wipe flags. Returns false if no such device exists.
+    pub async fn reset_device(&self, device: i64) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        for table in [
+            "folders",
+            "hierarchy_state",
+            "sync_state",
+            "items",
+            "client_ids",
+            "ping_state",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE device = ?1"))
+                .bind(device)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let r = sqlx::query(
+            "UPDATE devices SET policy_key = NULL, pending_policy_key = NULL,
+               last_sync_request = NULL WHERE id = ?1",
+        )
+        .bind(device)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Removes the device and all its state. Returns false if it didn't
+    /// exist.
+    pub async fn delete_device(&self, device: i64) -> Result<bool> {
+        let r = sqlx::query("DELETE FROM devices WHERE id = ?1")
+            .bind(device)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Returns false if no such device exists.
+    pub async fn request_wipe(&self, device: i64) -> Result<bool> {
+        let r = sqlx::query("UPDATE devices SET wipe_status = 1 WHERE id = ?1")
+            .bind(device)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
     }
 
     /// Records the temporary key of the first Provision round trip.
@@ -635,6 +751,18 @@ mod tests {
         let d = s.device("alice", "DEV1").await.unwrap().unwrap();
         assert_eq!(d.wipe, WipeStatus::Requested);
         assert!(s.device("bob", "DEV1").await.unwrap().is_none());
+
+        let listed = s.list_devices(Some("alice")).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].provisioned);
+        assert!(s.list_devices(Some("bob")).await.unwrap().is_empty());
+        assert!(s.set_blocked(d.id, true).await.unwrap());
+        assert!(s.device("alice", "DEV1").await.unwrap().unwrap().blocked);
+        assert!(s.reset_device(d.id).await.unwrap());
+        let after = s.device("alice", "DEV1").await.unwrap().unwrap();
+        assert_eq!(after.policy_key, None);
+        assert!(after.blocked, "reset keeps the block");
+        assert!(!s.set_blocked(9999, true).await.unwrap());
 
         assert_eq!(s.client_id(d.id, "c1").await.unwrap(), None);
         s.record_client_id(d.id, "c1", "m9").await.unwrap();

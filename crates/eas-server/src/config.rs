@@ -26,6 +26,9 @@ pub struct Config {
     /// `EAS_REQUIRE_PROVISIONING`, default `true`: refuse commands from
     /// devices without a policy key. Remote wipe only works with it on.
     pub require_provisioning: bool,
+    /// `EAS_ADMIN_TOKEN`: bearer token for `/admin`; the admin API is off
+    /// without it.
+    pub admin_token: Option<String>,
 }
 
 impl Config {
@@ -60,6 +63,7 @@ impl Config {
         let require_provisioning = var("EAS_REQUIRE_PROVISIONING")
             .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
             .unwrap_or(true);
+        let admin_token = var("EAS_ADMIN_TOKEN");
         Ok(Config {
             listen,
             stalwart_url,
@@ -69,6 +73,7 @@ impl Config {
             auth_cache_secs,
             db_url,
             require_provisioning,
+            admin_token,
         })
     }
 

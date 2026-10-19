@@ -63,7 +63,24 @@ cargo run --release -p eas-server
 | `EAS_AUTH_CACHE_SECS` | `300` | How long a successful login is reused |
 | `EAS_DB_URL` | `sqlite://eas.db` | State database (`sqlite:///data/eas.db` in the container image) |
 | `EAS_REQUIRE_PROVISIONING` | `true` | Refuse commands from devices without a policy key; remote wipe needs it |
+| `EAS_ADMIN_TOKEN` | unset | Bearer token for the admin API; the API is off without it |
 | `RUST_LOG` | `info` | Log filter; `debug` logs decoded request bodies (opaque data is never logged) |
+
+### Admin API and metrics
+
+With `EAS_ADMIN_TOKEN` set, the gateway serves a small admin API on its own port. Don't route `/admin` or `/metrics` through the public proxy.
+
+```sh
+T="Authorization: Bearer $EAS_ADMIN_TOKEN"
+curl -H "$T" http://gateway:8080/admin/devices                      # all devices
+curl -H "$T" 'http://gateway:8080/admin/devices?user=alice@example.org'
+curl -H "$T" -X POST http://gateway:8080/admin/devices/7/reset     # re-provision and resync from scratch
+curl -H "$T" -X POST http://gateway:8080/admin/devices/7/block     # or /unblock
+curl -H "$T" -X POST http://gateway:8080/admin/devices/7/wipe      # remote wipe on next contact
+curl -H "$T" -X DELETE http://gateway:8080/admin/devices/7         # forget the device (cancels a wipe)
+```
+
+`GET /metrics` serves Prometheus counters for requests by command and status, time spent per command, waiting `Ping`/`Sync` requests and the number of known devices.
 
 ### Caddy
 

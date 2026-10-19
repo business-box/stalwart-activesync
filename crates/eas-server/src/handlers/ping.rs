@@ -130,6 +130,7 @@ pub async fn handle(ctx: &Ctx<'_>, request: Option<Element>) -> HandlerResult {
     let mut rx = feed.receiver();
 
     let deadline = Instant::now() + Duration::from_secs(heartbeat);
+    let _waiting = crate::metrics::WaitGuard::new(&ctx.state.metrics.waiting);
     loop {
         match pending(ctx, &folders).await? {
             Err(()) => return Ok(wbxml(&reply(status::FOLDER_SYNC_REQUIRED))),

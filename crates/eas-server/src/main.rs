@@ -2,10 +2,12 @@
 //!
 //! Configuration comes from the environment; see `config.rs` and the README.
 
+mod admin;
 mod app;
 mod auth;
 mod config;
 mod handlers;
+mod metrics;
 mod push;
 
 #[cfg(test)]
@@ -55,6 +57,7 @@ async fn main() {
         locks: handlers::DeviceLocks::default(),
         push: push::PushHub::default(),
         pings: push::PingSlots::default(),
+        metrics: metrics::Metrics::default(),
         policy: eas_proto::provision::Policy::default(),
     });
 
@@ -97,6 +100,7 @@ mod tests {
             auth_cache_secs: 300,
             db_url: "sqlite::memory:".into(),
             require_provisioning: true,
+            admin_token: Some("admintoken".into()),
         };
         let endpoint = eas_jmap::StalwartEndpoint::new(&config.stalwart_url).unwrap();
         let auth = auth::Authenticator::new(endpoint, Duration::from_secs(300));
@@ -109,6 +113,7 @@ mod tests {
             locks: handlers::DeviceLocks::default(),
             push: push::PushHub::default(),
             pings: push::PingSlots::default(),
+            metrics: metrics::Metrics::default(),
             policy: eas_proto::provision::Policy::default(),
         }))
         .layer(axum::extract::connect_info::MockConnectInfo(

@@ -25,6 +25,21 @@ pub struct AppState {
     pub push: PushHub,
     pub pings: PingSlots,
     pub policy: Policy,
+    pub metrics: crate::metrics::Metrics,
+}
+
+async fn metrics(State(state): State<Arc<AppState>>) -> Response {
+    let devices = state
+        .store
+        .list_devices(None)
+        .await
+        .map(|d| d.len())
+        .unwrap_or(0);
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics.render(devices),
+    )
+        .into_response()
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -38,6 +53,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/Autodiscover/Autodiscover.xml", post(autodiscover))
         .route("/AutoDiscover/AutoDiscover.xml", post(autodiscover))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/metrics", get(metrics))
+        .merge(crate::admin::router())
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
 }
@@ -103,6 +120,26 @@ async fn activesync_post(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = std::time::Instant::now();
+    let label = RequestLine::parse(query.as_deref().unwrap_or(""))
+        .ok()
+        .and_then(|l| l.command)
+        .map(|c| c.name())
+        .unwrap_or("invalid");
+    let resp = activesync_request(&state, peer, query, headers, body).await;
+    state
+        .metrics
+        .record(label, resp.status().as_u16(), started.elapsed());
+    resp
+}
+
+async fn activesync_request(
+    state: &Arc<AppState>,
+    peer: SocketAddr,
+    query: Option<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {

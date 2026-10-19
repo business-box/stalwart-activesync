@@ -370,6 +370,7 @@ pub async fn handle(ctx: &Ctx<'_>, request: Option<Element>) -> HandlerResult {
         let (Some(deadline), Some(rx)) = (deadline, rx.as_mut()) else {
             return Ok(empty());
         };
+        let _waiting = crate::metrics::WaitGuard::new(&ctx.state.metrics.waiting);
         // Nothing changed: hold the request until push says mail moved, the
         // periodic recheck comes round, or the wait runs out.
         first = false;
