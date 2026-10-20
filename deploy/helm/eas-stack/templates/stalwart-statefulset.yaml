@@ -24,11 +24,6 @@ spec:
         fsGroup: 2000
         seccompProfile:
           type: RuntimeDefault
-        # Stalwart binds 25, 465 and 993 as uid 2000. Docker opens low ports
-        # to every user the same way; the sysctl is namespaced to the pod.
-        sysctls:
-          - name: net.ipv4.ip_unprivileged_port_start
-            value: "0"
       initContainers:
         # One volume holds both /etc/stalwart (config.json) and
         # /var/lib/stalwart (RocksDB).
@@ -86,6 +81,9 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: [ALL]
+              # The binary carries cap_net_bind_service (ports 25, 465, 993
+              # as uid 2000); without it in the set, exec fails with EPERM.
+              add: [NET_BIND_SERVICE]
           startupProbe:
             httpGet:
               path: /healthz/live
