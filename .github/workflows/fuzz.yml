@@ -1,0 +1,54 @@
+name: Fuzz
+
+# Every fuzz target for a few minutes each night, and on demand. A crash
+# fails the job and uploads the input that triggered it; reproduce with
+#   cd fuzz && cargo +nightly fuzz run <target> <crash-file>
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "300"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - wbxml_decode
+          - request_line
+          - device_items
+          - ics_parse
+          - tz_blob
+          - compose_prepare
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      # The corpus carries over between runs, so coverage keeps growing.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: fuzz
+        run: >
+          cargo fuzz run -O ${{ matrix.target }} --
+          -max_total_time=${{ inputs.seconds || '300' }} -max_len=4096 -rss_limit_mb=2048
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}

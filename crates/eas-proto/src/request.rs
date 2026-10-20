@@ -196,9 +196,12 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        // Hex digits are read as bytes: slicing the string here could cut a
+        // multi-byte character in half.
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
                 i += 3;
                 continue;
             }
@@ -232,6 +235,15 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_followed_by_multibyte_text_does_not_panic() {
+        // Found by the request_line fuzz target.
+        assert_eq!(percent_decode("a%\u{e9}b"), "a%\u{e9}b");
+        assert_eq!(percent_decode("%\u{1F600}"), "%\u{1F600}");
+        assert_eq!(percent_decode("x%41%4"), "xA%4");
+        assert!(RequestLine::parse("Cmd=Sync&DeviceId=%\u{e9}&DeviceType=x").is_err());
+    }
 
     #[test]
     fn plain_form() {

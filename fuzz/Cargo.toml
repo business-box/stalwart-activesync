@@ -1,0 +1,62 @@
+[package]
+name = "eas-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+eas-wbxml = { path = "../crates/eas-wbxml" }
+eas-proto = { path = "../crates/eas-proto" }
+eas-convert = { path = "../crates/eas-convert" }
+base64 = "0.22"
+serde_json = "1"
+
+# Not part of the main workspace: needs nightly and libFuzzer.
+[workspace]
+
+[[bin]]
+name = "wbxml_decode"
+path = "fuzz_targets/wbxml_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_line"
+path = "fuzz_targets/request_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "device_items"
+path = "fuzz_targets/device_items.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ics_parse"
+path = "fuzz_targets/ics_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tz_blob"
+path = "fuzz_targets/tz_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compose_prepare"
+path = "fuzz_targets/compose_prepare.rs"
+test = false
+doc = false
+bench = false

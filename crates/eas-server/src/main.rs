@@ -7,6 +7,7 @@ mod app;
 mod auth;
 mod config;
 mod handlers;
+mod load;
 mod metrics;
 mod probe;
 mod push;
@@ -28,12 +29,22 @@ async fn main() {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("probe") {
-        if let Err(e) = probe::run(&args[1..]).await {
-            eprintln!("probe failed: {e}");
-            std::process::exit(1);
+    match args.first().map(String::as_str) {
+        Some("probe") => {
+            if let Err(e) = probe::run(&args[1..]).await {
+                eprintln!("probe failed: {e}");
+                std::process::exit(1);
+            }
+            return;
         }
-        return;
+        Some("load") => {
+            if let Err(e) = load::run(&args[1..]).await {
+                eprintln!("load test failed: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        _ => {}
     }
 
     let config = match config::Config::from_env() {

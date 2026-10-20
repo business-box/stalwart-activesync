@@ -284,6 +284,8 @@ The deciding facts come from Stalwart's own repo and support portal: no EAS plan
 - [x] Phase 4 core: contacts (address books, cards both ways, ghosting-safe patches).
 - [x] Phase 3 core: calendar (events both ways, time zones, recurrence, exceptions, attendees, MeetingResponse).
 - [x] Meeting details in invitation mails.
+- [x] Hardening, first round: integration test against a Stalwart container in CI, fuzz targets for every parser of phone input (one panic found and fixed), load test with 500 waiting `Ping`s.
+- [x] Docker Compose test stack and Helm charts.
 - [ ] Single-occurrence responses, GAL and ResolveRecipients, contact photos, tasks.
 
 ## Sources
