@@ -1,0 +1,129 @@
+{{- $stalwartUrl := tpl .Values.stalwartUrl . }}
+{{- $publicUrl := tpl .Values.publicUrl . }}
+{{- if not $stalwartUrl }}{{ fail "stalwartUrl is required (Stalwart's HTTP root, e.g. http://stalwart:8080)" }}{{ end }}
+{{- if not $publicUrl }}{{ fail "publicUrl is required (e.g. https://mail.example.org)" }}{{ end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "stalwart-activesync.fullname" . }}
+  labels:
+    {{- include "stalwart-activesync.labels" . | nindent 4 }}
+spec:
+  # SQLite state on one volume: exactly one replica.
+  replicas: 1
+  serviceName: {{ include "stalwart-activesync.fullname" . }}
+  selector:
+    matchLabels:
+      {{- include "stalwart-activesync.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "stalwart-activesync.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "stalwart-activesync.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: gateway
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: STALWART_URL
+              value: {{ $stalwartUrl | quote }}
+            - name: EAS_PUBLIC_URL
+              value: {{ $publicUrl | quote }}
+            - name: EAS_LISTEN
+              value: "0.0.0.0:8080"
+            - name: EAS_DB_URL
+              value: sqlite:///data/eas.db
+            - name: EAS_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stalwart-activesync.adminSecret" . }}
+                  key: {{ include "stalwart-activesync.adminSecretKey" . }}
+            - name: EAS_REQUIRE_PROVISIONING
+              value: {{ .Values.config.requireProvisioning | quote }}
+            - name: EAS_TRUST_FORWARDED
+              value: {{ .Values.config.trustForwarded | quote }}
+            - name: EAS_MAX_BODY_MB
+              value: {{ .Values.config.maxBodyMb | quote }}
+            - name: EAS_AUTH_CACHE_SECS
+              value: {{ .Values.config.authCacheSecs | quote }}
+            - name: STALWART_REWRITE_URLS
+              value: {{ .Values.config.rewriteUrls | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.config.logLevel | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if not .Values.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

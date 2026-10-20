@@ -1,0 +1,96 @@
+name: Helm
+
+# Lints and validates both charts, then installs the full stack into a kind
+# cluster with the gateway built from this commit and plays a phone
+# against it.
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "deploy/helm/**"
+      - "deploy/bootstrap.py"
+      - ".github/workflows/helm.yml"
+  pull_request:
+    paths:
+      - "deploy/helm/**"
+      - "deploy/bootstrap.py"
+      - ".github/workflows/helm.yml"
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Install kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          sudo mv kubeconform /usr/local/bin/
+      - name: Gateway chart
+        run: |
+          cd deploy/helm/stalwart-activesync
+          helm lint . --set stalwartUrl=http://stalwart:8080 --set publicUrl=https://mail.example.org
+          helm template t . --set stalwartUrl=http://stalwart:8080 --set publicUrl=https://mail.example.org \
+            --set ingress.enabled=true --set 'ingress.hosts[0]=mail.example.org' \
+            | kubeconform -strict -summary -skip ServiceMonitor
+      - name: Stack chart
+        run: |
+          cd deploy/helm/eas-stack
+          helm dependency build .
+          helm lint .
+          helm template t . --set 'bootstrap.users[0]=alice:a-long-test-pass' \
+            --set ingress.tls.certManagerIssuer=letsencrypt | kubeconform -strict -summary
+          helm template t . --set bulwark.enabled=false --set global.autodiscoverHost= \
+            --set stalwart.mailService.enabled=false | kubeconform -strict -summary
+
+  kind:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: eas
+      - name: Build the gateway image
+        run: |
+          docker build -t stalwart-activesync:ci .
+          kind load docker-image stalwart-activesync:ci --name eas
+      - name: Install the stack
+        run: |
+          cd deploy/helm/eas-stack
+          helm dependency build .
+          # No ingress controller in kind; the probe talks to the gateway
+          # directly. The bootstrap job runs as a post-install hook.
+          helm install eas . --wait --timeout 10m \
+            --set ingress.enabled=false \
+            --set stalwart.mailService.type=ClusterIP \
+            --set stalwart-activesync.image.repository=stalwart-activesync \
+            --set stalwart-activesync.image.tag=ci \
+            --set stalwart-activesync.image.pullPolicy=Never \
+            --set global.mailHost=mail.example.test \
+            --set 'bootstrap.users[0]=alice:ci-alice-long-pass'
+      - name: Wait for Stalwart after the bootstrap restart
+        run: |
+          kubectl rollout status statefulset/eas-stalwart --timeout 5m
+          kubectl rollout status statefulset/eas-stalwart-activesync --timeout 2m
+          kubectl rollout status deployment/eas-bulwark --timeout 5m
+      - name: Probe as a phone
+        run: |
+          kubectl exec eas-stalwart-activesync-0 -- \
+            stalwart-activesync probe http://127.0.0.1:8080 alice@example.test ci-alice-long-pass --full
+      - name: Upgrade keeps the generated secrets
+        run: |
+          before=$(kubectl get secret eas-stalwart -o jsonpath='{.data.admin-password}')
+          cd deploy/helm/eas-stack
+          helm upgrade eas . --reuse-values --wait --timeout 10m
+          after=$(kubectl get secret eas-stalwart -o jsonpath='{.data.admin-password}')
+          test "$before" = "$after"
+      - if: failure()
+        name: Cluster state
+        run: |
+          kubectl get all,pvc,jobs -o wide
+          kubectl describe pods | tail -n 120
+          for p in $(kubectl get pods -o name); do echo "--- $p"; kubectl logs --all-containers --tail 60 $p || true; done

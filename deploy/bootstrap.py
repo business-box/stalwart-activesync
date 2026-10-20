@@ -11,7 +11,9 @@ admin on the plain HTTP port published to 127.0.0.1, and:
 - allows cross-origin JMAP for the webmail,
 - creates the test domain and users.
 
-Safe to run again: existing domains and users are left as they are.
+Safe to run again: existing domains and users are left as they are, and
+Stalwart only needs a restart when the HTTP settings actually changed
+(--restart-flag FILE writes FILE in that case).
 
     python3 bootstrap.py                      # reads .env next to this file
     python3 bootstrap.py --users carol:secret --domain example.org
@@ -96,6 +98,7 @@ def main():
         default=env.get("TEST_USERS", "alice:alice-test-pass,bob:bob-test-pass"),
         help="comma-separated name:password pairs (local part only)",
     )
+    p.add_argument("--restart-flag", help="write this file when Stalwart needs a restart")
     args = p.parse_args()
     if not args.admin_password:
         sys.exit("set STALWART_ADMIN_PASSWORD in .env or pass --admin-password")
@@ -117,24 +120,18 @@ def main():
     else:
         print(f"domain   {args.domain} exists")
 
-    settings, http = s.call(
-        (
-            "x:SystemSettings/set",
-            {
-                "update": {
-                    "singleton": {
-                        "defaultHostname": mail_host,
-                        "defaultDomainId": domain_id,
-                    }
-                }
-            },
-        ),
-        ("x:Http/set", {"update": {"singleton": {"useXForwarded": True, "usePermissiveCors": True}}}),
-    )
-    for name, res in (("system settings", settings), ("http settings", http)):
+    wanted_http = {"useXForwarded": True, "usePermissiveCors": True}
+    (current,) = s.call(("x:Http/get", {"ids": ["singleton"], "properties": list(wanted_http)}))
+    current = (current.get("list") or [{}])[0]
+    http_changed = any(current.get(k) != v for k, v in wanted_http.items())
+    calls = [("x:SystemSettings/set", {"update": {"singleton": {"defaultHostname": mail_host, "defaultDomainId": domain_id}}})]
+    if http_changed:
+        calls.append(("x:Http/set", {"update": {"singleton": wanted_http}}))
+    results = s.call(*calls)
+    for name, res in zip(("system settings", "http settings"), results):
         if "singleton" not in res.get("updated", {}):
             sys.exit(f"could not update {name}: {res.get('notUpdated')}")
-    print(f"settings hostname {mail_host}, X-Forwarded-For on, CORS open")
+    print(f"settings hostname {mail_host}, X-Forwarded-For on, CORS open" + ("" if http_changed else " (unchanged)"))
 
     (accounts,) = s.call(("x:Account/get", {"ids": None, "properties": ["name", "domainId"]}))
     existing = {(a.get("name"), a.get("domainId")) for a in accounts["list"]}
@@ -162,7 +159,13 @@ def main():
         if "u" not in res.get("created", {}):
             sys.exit(f"could not create {name}: {res.get('notCreated')}")
         print(f"user     {name}@{args.domain} created (password {password})")
-    print("done; restart Stalwart so the HTTP settings apply: docker compose restart stalwart")
+    if http_changed:
+        if args.restart_flag:
+            with open(args.restart_flag, "w") as f:
+                f.write("http settings changed\n")
+        print("done; restart Stalwart so the HTTP settings apply (docker compose restart stalwart)")
+    else:
+        print("done")
 
 
 if __name__ == "__main__":

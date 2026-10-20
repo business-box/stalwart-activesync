@@ -1,0 +1,67 @@
+{{- if .Values.ingress.enabled }}
+{{- $g := .Values.global }}
+{{- $gateway := include "eas-stack.gateway" . }}
+{{- $gwPort := (index .Values "stalwart-activesync").service.port }}
+{{- $hosts := compact (list $g.mailHost $g.autodiscoverHost (ternary $g.webmailHost "" .Values.bulwark.enabled)) }}
+{{- $tls := .Values.ingress.tls }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    {{- include "eas-stack.labels" . | nindent 4 }}
+  annotations:
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if and $tls.enabled $tls.certManagerIssuer }}
+    {{- if eq $tls.certManagerIssuerKind "Issuer" }}
+    cert-manager.io/issuer: {{ $tls.certManagerIssuer | quote }}
+    {{- else }}
+    cert-manager.io/cluster-issuer: {{ $tls.certManagerIssuer | quote }}
+    {{- end }}
+    {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if $tls.enabled }}
+  tls:
+    - secretName: {{ $tls.secretName | default (printf "%s-tls" .Release.Name) }}
+      hosts:
+        {{- toYaml $hosts | nindent 8 }}
+  {{- end }}
+  rules:
+    # ActiveSync and autodiscover to the gateway, the rest to Stalwart
+    # (web UI, JMAP, DAV, discovery documents). /admin and /metrics of the
+    # gateway are never routed.
+    - host: {{ $g.mailHost | quote }}
+      http:
+        paths:
+          {{- include "stalwart-activesync.ingressPaths" (dict "service" $gateway "port" $gwPort) | nindent 10 }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "eas-stack.stalwart" . }}
+                port:
+                  name: http
+    {{- with $g.autodiscoverHost }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          {{- include "stalwart-activesync.ingressPaths" (dict "service" $gateway "port" $gwPort) | nindent 10 }}
+    {{- end }}
+    {{- if .Values.bulwark.enabled }}
+    - host: {{ $g.webmailHost | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "eas-stack.bulwark" . }}
+                port:
+                  name: http
+    {{- end }}
+{{- end }}

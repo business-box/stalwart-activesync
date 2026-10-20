@@ -1,0 +1,20 @@
+Stalwart, the ActiveSync gateway{{ if .Values.bulwark.enabled }} and Bulwark webmail{{ end }} are installed.
+
+Point DNS for these names at your ingress controller:
+  {{ .Values.global.mailHost }}{{ with .Values.global.autodiscoverHost }}, {{ . }}{{ end }}{{ if .Values.bulwark.enabled }}, {{ .Values.global.webmailHost }}{{ end }}
+{{- if .Values.stalwart.mailService.enabled }}
+and the MX record for {{ include "eas-stack.domain" . }} (plus IMAP/SMTP clients) at the
+address of service {{ include "eas-stack.stalwart" . }}-mail:
+  kubectl -n {{ .Release.Namespace }} get svc {{ include "eas-stack.stalwart" . }}-mail
+{{- end }}
+
+Stalwart web UI: https://{{ .Values.global.mailHost }}/admin  (user "admin")
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "eas-stack.stalwartSecret" . }} -o jsonpath='{.data.admin-password}' | base64 -d
+{{- if .Values.bulwark.enabled }}
+Webmail: https://{{ .Values.global.webmailHost }}
+{{- end }}
+Phones: add an Exchange account with the mail address and password; server
+{{ .Values.global.mailHost }} if they don't find it on their own.
+
+Check it as a phone would:
+  kubectl -n {{ .Release.Namespace }} exec -it {{ include "eas-stack.gateway" . }}-0 -- stalwart-activesync probe http://127.0.0.1:8080 user@{{ include "eas-stack.domain" . }} 'password'

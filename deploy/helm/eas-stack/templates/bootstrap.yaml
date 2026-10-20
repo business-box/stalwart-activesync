@@ -1,0 +1,159 @@
+{{- if .Values.bootstrap.enabled }}
+{{- $name := printf "%s-bootstrap" .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- $stalwart := include "eas-stack.stalwart" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "eas-stack.labels" . | nindent 4 }}
+data:
+  bootstrap.py: |
+    {{- .Files.Get "files/bootstrap.py" | nindent 4 }}
+  # Waits for Stalwart, and deletes its pod (the StatefulSet starts a new
+  # one) when bootstrap.py changed settings that apply on restart.
+  run.py: |
+    import os, ssl, subprocess, sys, time, urllib.request
+
+    stalwart = os.environ["STALWART_URL"]
+    for _ in range(150):
+        try:
+            urllib.request.urlopen(stalwart + "/healthz/ready", timeout=5)
+            break
+        except Exception as e:
+            print(f"waiting for Stalwart: {e}", flush=True)
+            time.sleep(2)
+    else:
+        sys.exit("Stalwart did not become ready")
+
+    flag = "/tmp/restart-stalwart"
+    subprocess.run(
+        [sys.executable, "/scripts/bootstrap.py", "--url", stalwart,
+         "--domain", os.environ["DOMAIN"], "--users", os.environ.get("TEST_USERS", ""),
+         "--restart-flag", flag],
+        check=True,
+    )
+    if os.path.exists(flag):
+        sa = "/var/run/secrets/kubernetes.io/serviceaccount"
+        ns = open(f"{sa}/namespace").read().strip()
+        token = open(f"{sa}/token").read().strip()
+        host = os.environ["KUBERNETES_SERVICE_HOST"]
+        host = f"[{host}]" if ":" in host else host
+        url = f"https://{host}:{os.environ['KUBERNETES_SERVICE_PORT']}/api/v1/namespaces/{ns}/pods/{os.environ['STALWART_POD']}"
+        req = urllib.request.Request(url, method="DELETE", headers={"Authorization": f"Bearer {token}"})
+        urllib.request.urlopen(req, context=ssl.create_default_context(cafile=f"{sa}/ca.crt"), timeout=30)
+        print(f"restarted {os.environ['STALWART_POD']} so the HTTP settings apply")
+{{- if not .Values.bootstrap.existingSecret }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "eas-stack.labels" . | nindent 4 }}
+type: Opaque
+data:
+  users: {{ join "," .Values.bootstrap.users | b64enc | quote }}
+{{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "eas-stack.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "eas-stack.labels" . | nindent 4 }}
+rules:
+  # Only Stalwart's pod, only to restart it.
+  - apiGroups: [""]
+    resources: [pods]
+    resourceNames: [{{ printf "%s-0" $stalwart | quote }}]
+    verbs: [get, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "eas-stack.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "eas-stack.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        {{- include "eas-stack.labels" . | nindent 8 }}
+        app.kubernetes.io/name: bootstrap
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ $name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bootstrap
+          image: {{ .Values.bootstrap.image }}
+          command: [python3, -I, /scripts/run.py]
+          env:
+            - name: STALWART_URL
+              value: {{ printf "http://%s:8080" $stalwart | quote }}
+            - name: STALWART_POD
+              value: {{ printf "%s-0" $stalwart | quote }}
+            - name: MAIL_HOST
+              value: {{ .Values.global.mailHost | quote }}
+            - name: DOMAIN
+              value: {{ include "eas-stack.domain" . | quote }}
+            - name: STALWART_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "eas-stack.stalwartSecret" . }}
+                  key: admin-password
+            - name: TEST_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.bootstrap.existingSecret | default $name }}
+                  key: users
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $name }}
+        - name: tmp
+          emptyDir: {}
+{{- end }}

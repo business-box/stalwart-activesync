@@ -1,0 +1,16 @@
+The ActiveSync gateway is running as {{ include "stalwart-activesync.fullname" . }}.
+
+Phones connect to {{ tpl .Values.publicUrl . }}/Microsoft-Server-ActiveSync.
+{{- if not .Values.ingress.enabled }}
+Route that path and /autodiscover/autodiscover.xml (all spellings) from your
+ingress to service {{ include "stalwart-activesync.fullname" . }}:{{ .Values.service.port }}, with read
+and send timeouts above 60 minutes. Don't expose /admin or /metrics.
+{{- end }}
+
+Admin API (devices, reset, wipe):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "stalwart-activesync.fullname" . }} 8081:{{ .Values.service.port }}
+  TOKEN=$(kubectl -n {{ .Release.Namespace }} get secret {{ include "stalwart-activesync.adminSecret" . }} -o jsonpath='{.data.{{ include "stalwart-activesync.adminSecretKey" . }}}' | base64 -d)
+  curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/admin/devices
+
+Check it end to end, as a phone would:
+  kubectl -n {{ .Release.Namespace }} exec -it {{ include "stalwart-activesync.fullname" . }}-0 -- stalwart-activesync probe {{ tpl .Values.publicUrl . }} user@example.org 'password'

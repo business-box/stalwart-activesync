@@ -1,0 +1,6 @@
+dependencies:
+- name: stalwart-activesync
+  repository: file://../stalwart-activesync
+  version: 0.1.0
+digest: sha256:d235f0f31aaf9319cccb612ae5d2002356c2c5574aa1cbfea77a46a097ced623
+generated: "2026-10-20T08:28:57.420509861Z"

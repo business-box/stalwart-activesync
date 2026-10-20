@@ -1,0 +1,14 @@
+apiVersion: v2
+name: stalwart-activesync
+description: Exchange ActiveSync gateway for Stalwart (phones sync mail, calendars and contacts over EAS; the gateway talks JMAP to Stalwart)
+type: application
+version: 0.1.0
+appVersion: "latest"
+home: https://github.com/business-box/stalwart-activesync
+sources:
+  - https://github.com/business-box/stalwart-activesync
+keywords:
+  - activesync
+  - stalwart
+  - mail
+  - jmap

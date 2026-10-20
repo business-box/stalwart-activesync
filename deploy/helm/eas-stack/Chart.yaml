@@ -1,0 +1,11 @@
+apiVersion: v2
+name: eas-stack
+description: Stalwart mail server with the ActiveSync gateway and Bulwark webmail, behind one Ingress
+type: application
+version: 0.1.0
+appVersion: "latest"
+home: https://github.com/business-box/stalwart-activesync
+dependencies:
+  - name: stalwart-activesync
+    version: 0.1.0
+    repository: file://../stalwart-activesync

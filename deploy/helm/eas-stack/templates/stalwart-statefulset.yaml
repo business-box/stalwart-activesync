@@ -1,0 +1,137 @@
+{{- $name := include "eas-stack.stalwart" . }}
+{{- $s := .Values.stalwart }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "eas-stack.commonLabels" . | nindent 4 }}
+    {{- include "eas-stack.stalwartSelector" . | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: {{ $name }}-headless
+  selector:
+    matchLabels:
+      {{- include "eas-stack.stalwartSelector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "eas-stack.stalwartSelector" . | nindent 8 }}
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/stalwart-secret.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+        # Stalwart binds 25, 465 and 993 as uid 2000. Docker opens low ports
+        # to every user the same way; the sysctl is namespaced to the pod.
+        sysctls:
+          - name: net.ipv4.ip_unprivileged_port_start
+            value: "0"
+      initContainers:
+        # One volume holds both /etc/stalwart (config.json) and
+        # /var/lib/stalwart (RocksDB).
+        - name: seed
+          image: "{{ $s.image.repository }}:{{ $s.image.tag }}"
+          imagePullPolicy: {{ $s.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /vol/etc /vol/data
+              if [ "$SEED" = "true" ] && [ ! -f /vol/etc/config.json ]; then
+                echo '{"@type":"RocksDb","path":"/var/lib/stalwart/db"}' > /vol/etc/config.json
+                echo "wrote config.json"
+              fi
+          env:
+            - name: SEED
+              value: {{ $s.seedConfig | quote }}
+          securityContext:
+            runAsUser: 2000
+            runAsGroup: 2000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: data
+              mountPath: /vol
+      containers:
+        - name: stalwart
+          image: "{{ $s.image.repository }}:{{ $s.image.tag }}"
+          imagePullPolicy: {{ $s.image.pullPolicy }}
+          env:
+            - name: STALWART_HOSTNAME
+              value: {{ .Values.global.mailHost | quote }}
+            - name: STALWART_PUBLIC_URL
+              value: {{ printf "https://%s" .Values.global.mailHost | quote }}
+            - name: STALWART_RECOVERY_ADMIN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "eas-stack.stalwartSecret" . }}
+                  key: recovery-admin
+            {{- with $s.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+            {{- range $s.mailService.ports }}
+            - name: {{ .name }}
+              containerPort: {{ .targetPort | default .port }}
+            {{- end }}
+          securityContext:
+            runAsUser: 2000
+            runAsGroup: 2000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          startupProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            periodSeconds: 3
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: http
+            periodSeconds: 10
+          resources:
+            {{- toYaml $s.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /etc/stalwart
+              subPath: etc
+            - name: data
+              mountPath: /var/lib/stalwart
+              subPath: data
+      {{- with $s.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml $s.persistence.accessModes | nindent 10 }}
+        {{- with $s.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $s.persistence.size }}

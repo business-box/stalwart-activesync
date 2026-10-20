@@ -40,6 +40,8 @@ It lets the built-in mail, calendar and contacts apps on iOS and Android (Gmail,
 
 For a complete local or server test setup (Stalwart, this gateway, Bulwark webmail and Caddy) see [deploy/README.md](deploy/README.md): `docker compose up`, one bootstrap script for a domain and test users, and a probe that plays a phone.
 
+On Kubernetes, [deploy/helm](deploy/helm/README.md) has a chart for the gateway alone and one for the whole stack (Stalwart, the gateway, Bulwark, an Ingress and a bootstrap Job).
+
 `stalwart-activesync probe <https://mail.example.org> <user> <password> [--insecure] [--full]` checks any deployment end to end: OPTIONS, Provision, FolderSync, and a first Sync of the inbox, contacts and calendar. With `--full` it also holds a `Ping`, mails itself and waits for the push, and creates and deletes a contact and an event (it writes to the account, so use a test user).
 
 Images are built by GitHub Actions and pushed to the GitHub Container Registry: `ghcr.io/business-box/stalwart-activesync`, tagged with the branch name, the short commit SHA, `latest` for the default branch and the version for `v*` tags.

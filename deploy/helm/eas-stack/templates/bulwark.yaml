@@ -1,0 +1,151 @@
+{{- if .Values.bulwark.enabled }}
+{{- $name := include "eas-stack.bulwark" . }}
+{{- $b := .Values.bulwark }}
+{{- $secret := $b.sessionSecret | default (include "eas-stack.keep" (dict "ns" .Release.Namespace "name" $name "key" "session-secret" "default" (randAlphaNum 44))) }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "eas-stack.labels" . | nindent 4 }}
+type: Opaque
+data:
+  session-secret: {{ $secret | b64enc | quote }}
+---
+{{- if $b.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "eas-stack.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with $b.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $b.persistence.size }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "eas-stack.commonLabels" . | nindent 4 }}
+    {{- include "eas-stack.bulwarkSelector" . | nindent 4 }}
+spec:
+  replicas: 1
+  # One ReadWriteOnce volume: stop the old pod before starting the new one.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "eas-stack.bulwarkSelector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "eas-stack.bulwarkSelector" . | nindent 8 }}
+      annotations:
+        checksum/secret: {{ $secret | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: dirs
+          image: "{{ $b.image.repository }}:{{ $b.image.tag }}"
+          imagePullPolicy: {{ $b.image.pullPolicy }}
+          command: [sh, -c, "mkdir -p /app/data/settings /app/data/admin /app/data/admin-state /app/data/telemetry"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+      containers:
+        - name: bulwark
+          image: "{{ $b.image.repository }}:{{ $b.image.tag }}"
+          imagePullPolicy: {{ $b.image.pullPolicy }}
+          env:
+            - name: HOSTNAME
+              value: 0.0.0.0
+            - name: PORT
+              value: "3000"
+            - name: APP_NAME
+              value: {{ $b.appName | quote }}
+            # Browsers and Bulwark's server both use the public JMAP URL.
+            - name: JMAP_SERVER_URL
+              value: {{ printf "https://%s" .Values.global.mailHost | quote }}
+            - name: STALWART_FEATURES
+              value: "true"
+            - name: SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $name }}
+                  key: session-secret
+            - name: TRUSTED_PROXY_DEPTH
+              value: "1"
+            - name: BULWARK_TELEMETRY
+              value: "off"
+            {{- with $b.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 3000
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 3
+            failureThreshold: 40
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+          resources:
+            {{- toYaml $b.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+      volumes:
+        - name: data
+          {{- if $b.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $name }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "eas-stack.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+  selector:
+    {{- include "eas-stack.bulwarkSelector" . | nindent 4 }}
+{{- end }}

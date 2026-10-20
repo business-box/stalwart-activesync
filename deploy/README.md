@@ -11,6 +11,8 @@ the whole thing on a laptop or a server.
 | `bulwark` | [Bulwark](https://github.com/bulwarkmail/webmail) webmail over JMAP | `https://WEBMAIL_HOST` |
 | `stalwart-init` | Writes a minimal `config.json` on first start so Stalwart skips its setup wizard | runs once |
 
+For Kubernetes, see [helm/README.md](helm/README.md).
+
 All services share one Docker network; only Caddy, Stalwart's mail ports and the two loopback ports are published.
 
 ## Quick start on a laptop

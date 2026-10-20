@@ -1,0 +1,108 @@
+global:
+  # Public names; DNS for all three points at the ingress controller.
+  mailHost: mail.example.org
+  webmailHost: webmail.example.org
+  # Phones try autodiscover.<domain> when the user only types an address.
+  # Leave empty to skip it.
+  autodiscoverHost: autodiscover.example.org
+
+stalwart:
+  image:
+    repository: stalwartlabs/stalwart
+    tag: v0.16.27
+    pullPolicy: IfNotPresent
+  # Recovery admin ("admin") for the web UI and the bootstrap job. Left
+  # empty, a password is generated and kept across upgrades; read it with
+  #   kubectl get secret <release>-stalwart -o jsonpath='{.data.admin-password}' | base64 -d
+  adminPassword: ""
+  existingSecret: ""   # needs keys admin-password and recovery-admin ("admin:<password>")
+  # Write a minimal config.json (RocksDB under /var/lib/stalwart) on first
+  # start so Stalwart skips its setup wizard. Set false to run the wizard
+  # (kubectl port-forward svc/<release>-stalwart 8080).
+  seedConfig: true
+  persistence:
+    size: 10Gi
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 2Gi
+  extraEnv: []
+  # SMTP, IMAP and friends go straight to Stalwart, not through the
+  # ingress. Stalwart's default listeners: 25 smtp, 465 submissions,
+  # 993 imaps, 995 pop3s, 4190 managesieve.
+  mailService:
+    enabled: true
+    type: LoadBalancer
+    # Keep the client address visible to Stalwart (spam checks, rate limits).
+    externalTrafficPolicy: Local
+    loadBalancerIP: ""
+    annotations: {}
+    ports:
+      - {name: smtp, port: 25}
+      - {name: submissions, port: 465}
+      - {name: imaps, port: 993}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# The gateway subchart; see ../stalwart-activesync/values.yaml.
+stalwart-activesync:
+  stalwartUrl: "http://{{ .Release.Name }}-stalwart:8080"
+  publicUrl: "https://{{ .Values.global.mailHost }}"
+
+bulwark:
+  enabled: true
+  image:
+    repository: ghcr.io/bulwarkmail/webmail
+    tag: latest
+    pullPolicy: IfNotPresent
+  appName: Bulwark Webmail
+  # Encrypts "remember me" and stored settings. Generated when empty.
+  sessionSecret: ""
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  extraEnv: []
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    # Ping and Sync with Wait hold requests open for up to 59 minutes;
+    # JMAP push (EventSource) is long-lived too.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3900"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3900"
+    nginx.ingress.kubernetes.io/proxy-body-size: 50m
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+  tls:
+    enabled: true
+    # Certificate for all names, issued by cert-manager when set ...
+    certManagerIssuer: ""          # e.g. letsencrypt-prod
+    certManagerIssuerKind: ClusterIssuer
+    # ... or an existing kubernetes.io/tls Secret.
+    secretName: ""
+
+# A post-install/post-upgrade Job that creates the mail domain and users,
+# turns on X-Forwarded-For and CORS for the webmail, and restarts Stalwart
+# when those HTTP settings changed. Runs deploy/bootstrap.py.
+bootstrap:
+  enabled: true
+  image: python:3.12-alpine
+  # Mail domain; defaults to mailHost without its first label.
+  domain: ""
+  # Users to create, as "name:password" (local part only). Existing users
+  # are left alone. Use existingSecret (key "users", comma-separated) to
+  # keep passwords out of values.
+  users: []
+  existingSecret: ""

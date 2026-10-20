@@ -1,0 +1,108 @@
+# Stalwart's HTTP root as the gateway sees it, usually the in-cluster
+# Service. Templated, so "http://{{ .Release.Name }}-stalwart:8080" works.
+stalwartUrl: ""
+# Public origin phones use (https://mail.example.org). Autodiscover sends
+# phones to <publicUrl>/Microsoft-Server-ActiveSync. Templated.
+publicUrl: ""
+
+image:
+  repository: ghcr.io/business-box/stalwart-activesync
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# The gateway keeps device and sync state in SQLite on one volume, so it
+# runs as a single replica.
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+
+# Bearer token for /admin. Left empty, the chart generates one and keeps it
+# across upgrades (in the Secret <fullname>). Or point at your own Secret.
+adminToken:
+  value: ""
+  existingSecret: ""
+  existingSecretKey: admin-token
+
+config:
+  # Refuse commands from devices without a policy key; remote wipe needs it.
+  requireProvisioning: true
+  # Take the client IP from X-Forwarded-For (the ingress controller sets it).
+  trustForwarded: true
+  maxBodyMb: 50
+  authCacheSecs: 300
+  # Reach Stalwart's JMAP API, blobs and push at stalwartUrl even though its
+  # session names the public https:// hostname.
+  rewriteUrls: true
+  logLevel: info
+
+# Extra environment variables, as a list of EnvVar objects.
+extraEnv: []
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# Routes only the ActiveSync and autodiscover paths to the gateway. Never
+# route /admin or /metrics publicly. With ingress-nginx, an Ingress for the
+# same host from another release (Stalwart's) is merged with this one.
+ingress:
+  enabled: false
+  className: ""
+  annotations:
+    # Ping and Sync with Wait hold requests open for up to 59 minutes.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3900"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3900"
+    nginx.ingress.kubernetes.io/proxy-body-size: 50m
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+  hosts: []
+  #  - mail.example.org
+  #  - autodiscover.example.org
+  tls: []
+  #  - secretName: mail-tls
+  #    hosts: [mail.example.org, autodiscover.example.org]
+
+metrics:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 512Mi
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+nameOverride: ""
+fullnameOverride: ""
